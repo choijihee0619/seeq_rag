@@ -1,44 +1,41 @@
-# 핵심 의존성
+# 핵심 웹 프레임워크
 fastapi==0.109.0
 uvicorn[standard]==0.27.0
-pydantic==2.5.3
-pydantic-settings==2.1.0
 python-multipart==0.0.6
 
-# LangChain 관련
+# 데이터 검증 및 설정
+pydantic==2.5.3
+pydantic-settings==2.1.0
+python-dotenv==1.0.0
+
+# LangChain 및 AI
 langchain==0.1.5
 langchain-openai==0.0.5
 langchain-community==0.0.17
-
-# OpenAI
 openai==1.10.0
 
-# MongoDB
+# 데이터베이스 (MongoDB)
 pymongo==4.6.1
 motor==3.3.2
-
-# 유틸리티
-python-dotenv==1.0.0
-aiofiles==23.2.1
-pandas==2.1.4
-numpy==1.26.3
 
 # 문서 처리
 pypdf==3.17.4
 python-docx==1.1.0
 beautifulsoup4==4.12.3
 
-# YouTube API 연동
+# 수학 연산 (벡터 유사도 계산용)
+numpy==1.26.3
+
+# 외부 API 연동
 google-api-python-client==2.108.0
 google-auth-httplib2==0.1.1
 google-auth-oauthlib==1.1.0
-
-# HTTP 요청
 httpx==0.26.0
 
-# 로깅 및 모니터링
+# 로깅
 loguru==0.7.2
 
-# 테스트
-pytest==7.4.4
-pytest-asyncio==0.23.3
+# 제거된 의존성들 (사용하지 않음):
+# - pandas: 실제 사용되지 않음
+# - aiofiles: 실제 사용되지 않음  
+# - pytest, pytest-asyncio: 테스트 파일이 없음

@@ -33,6 +33,9 @@ class YouTubeAPI:
         # 디버깅 정보 출력
         logger.info(f"YouTube API 키 초기화 - 제공된 키: {'있음' if api_key else '없음'}")
         logger.info(f"환경변수에서 로드된 키: {'있음' if os.getenv('YOUTUBE_API_KEY') else '없음'}")
+        if self.api_key:
+            logger.info(f"최종 API 키 길이: {len(self.api_key)}")
+            logger.info(f"API 키 시작 부분: {self.api_key[:10]}...")
         
         if not self.api_key:
             logger.warning("YouTube API 키가 설정되지 않았습니다. 환경변수 YOUTUBE_API_KEY를 확인하세요.")
@@ -47,6 +50,10 @@ class YouTubeAPI:
                 logger.info("YouTube API 초기화 완료")
             except Exception as e:
                 logger.error(f"YouTube API 초기화 실패: {e}")
+
+    def is_available(self) -> bool:
+        """YouTube API 사용 가능 여부 확인"""
+        return self.youtube is not None and self.api_key is not None
 
     async def search_videos(
         self,

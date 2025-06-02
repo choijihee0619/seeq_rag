@@ -4,6 +4,7 @@ MODIFIED 2024-01-20: YouTube 연동 옵션 추가 및 응답 모델 확장
 FIXED 2024-01-20: YouTube 동영상 저장 API 수정
 ENHANCED 2024-01-21: 업로드된 파일 기반 자동 추천 기능 추가
 CLEANED 2024-01-21: 불필요한 YouTube 개별 API 제거, 핵심 기능만 유지
+OPTIMIZED 2024-01-21: 디버그 엔드포인트 제거, 프로덕션 준비 완료
 """
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -18,7 +19,7 @@ router = APIRouter()
 class RecommendRequest(BaseModel):
     """추천 요청 모델"""
     keywords: List[str]
-    content_types: List[str] = ["book", "movie", "video", "youtube_video"]
+    content_types: List[str] = ["book", "movie", "youtube_video"]
     max_items: int = 10
     include_youtube: bool = True  # YouTube 검색 포함 여부
     youtube_max_per_keyword: int = 3  # 키워드당 YouTube 결과 수
@@ -27,7 +28,7 @@ class FileBasedRecommendRequest(BaseModel):
     """파일 기반 추천 요청 모델"""
     file_id: Optional[str] = None  # 특정 파일 ID
     folder_id: Optional[str] = None  # 폴더 ID (폴더 내 모든 파일)
-    content_types: List[str] = ["book", "movie", "video", "youtube_video"]
+    content_types: List[str] = ["book", "movie", "youtube_video"]
     max_items: int = 10
     include_youtube: bool = True
     youtube_max_per_keyword: int = 3

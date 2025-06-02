@@ -41,12 +41,21 @@ class QueryChain:
     ) -> Dict:
         """질의 처리"""
         try:
+            # folder_id 정리 - "string" 값은 None으로 처리
+            clean_folder_id = None
+            if folder_id and folder_id.strip() and folder_id not in ["string", "null"]:
+                clean_folder_id = folder_id.strip()
+            
+            logger.info(f"질의 처리 시작 - 쿼리: '{query}', 폴더: '{clean_folder_id}', top_k: {top_k}")
+            
             # 1. 관련 문서 검색
             search_results = await self.hybrid_search.search(
                 query=query,
                 k=top_k,
-                folder_id=folder_id
+                folder_id=clean_folder_id
             )
+            
+            logger.info(f"검색 결과: {len(search_results)}개 청크")
             
             # 2. 컨텍스트 구성
             context = self.context_builder.build_context(search_results)
@@ -59,18 +68,29 @@ class QueryChain:
             
             answer = await self.llm_client.generate(prompt)
             
-            # 4. 결과 반환
+            # 4. 소스 정보 구성 - 파일명 포함
+            sources = []
+            for result in search_results:
+                chunk = result.get("chunk", {})
+                document = result.get("document", {})
+                
+                source_info = {
+                    "text": chunk.get("text", "")[:200] + "...",
+                    "score": round(result.get("score", 0.0), 3),
+                    "filename": document.get("original_filename", "알 수 없는 파일"),
+                    "file_id": chunk.get("file_id", ""),
+                    "chunk_id": chunk.get("chunk_id", ""),
+                    "sequence": chunk.get("sequence", 0),
+                    "file_type": document.get("file_type", "unknown")
+                }
+                sources.append(source_info)
+            
+            logger.info(f"질의 처리 완료 - 답변 길이: {len(answer)}, 소스: {len(sources)}개")
+            
+            # 5. 결과 반환
             return {
                 "answer": answer,
-                "sources": [
-                    {
-                        "text": result.get("chunk", {}).get("text", "")[:200] + "...",
-                        "score": result["score"],
-                        "filename": result.get("document", {}).get("original_filename", "알 수 없는 파일"),
-                        "chunk_id": result.get("chunk", {}).get("chunk_id", "")
-                    }
-                    for result in search_results
-                ],
+                "sources": sources,
                 "confidence": 0.9
             }
             

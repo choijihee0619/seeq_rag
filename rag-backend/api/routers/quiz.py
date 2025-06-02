@@ -22,8 +22,10 @@ class QuizRequest(BaseModel):
 class QuizItem(BaseModel):
     """퀴즈 항목 모델"""
     question: str
-    options: Optional[List[str]] = None
-    correct_option: Optional[int] = None
+    quiz_type: Optional[str] = "multiple_choice"  # multiple_choice, true_false, short_answer, fill_in_blank
+    options: Optional[List[str]] = None  # 객관식/참거짓용
+    correct_option: Optional[int] = None  # 객관식/참거짓용 정답 인덱스
+    correct_answer: Optional[str] = None  # 단답형/빈칸채우기용 정답
     difficulty: str
     explanation: Optional[str] = None
 
@@ -54,8 +56,10 @@ async def generate_quiz(request: QuizRequest):
         for quiz in result["quizzes"]:
             quiz_items.append(QuizItem(
                 question=quiz["question"],
+                quiz_type=quiz.get("quiz_type", "multiple_choice"),
                 options=quiz.get("options"),
                 correct_option=quiz.get("correct_option"),
+                correct_answer=quiz.get("correct_answer"),
                 difficulty=quiz["difficulty"],
                 explanation=quiz.get("explanation")
             ))

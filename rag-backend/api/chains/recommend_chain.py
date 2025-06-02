@@ -4,11 +4,15 @@
 MODIFIED 2024-01-20: YouTube API 연동 추가 - 실시간 YouTube 동영상 추천 기능 통합
 ENHANCED 2024-01-21: 파일 기반 키워드 자동 추출 기능 추가
 CLEANED 2024-01-21: 불필요한 YouTube 개별 API 제거, 핵심 추천 기능만 유지
+REFACTORED 2024-01-21: 키워드 추출 통합 및 TextCollector 적용
 """
 from typing import Dict, List, Optional
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from utils.logger import get_logger
 from utils.youtube_api import youtube_api
+from utils.text_collector import TextCollector
+from ai_processing.labeler import AutoLabeler
+from utils.web_recommendation import web_recommendation_engine
 
 logger = get_logger(__name__)
 
@@ -24,7 +28,7 @@ class RecommendChain:
     async def process(
         self,
         keywords: List[str],
-        content_types: List[str] = ["book", "movie", "video"],
+        content_types: List[str] = ["book", "movie", "youtube_video"],
         max_items: int = 10,
         include_youtube: bool = True,
         youtube_max_per_keyword: int = 3
@@ -48,22 +52,29 @@ class RecommendChain:
             )
             recommendations.extend(db_recommendations)
             
-            # 2. YouTube 실시간 검색 (video 타입이 포함된 경우)
+            # 2. YouTube 실시간 검색 (include_youtube가 True이고 video 관련 타입이 포함된 경우)
             if include_youtube and ("video" in content_types or "youtube_video" in content_types):
                 youtube_recommendations = await self._search_youtube_recommendations(
                     keywords, youtube_max_per_keyword
                 )
                 recommendations.extend(youtube_recommendations)
             
-            # 3. 결과 정렬 및 제한
+            # 3. 웹 검색 기반 실시간 추천 (book, movie, video 타입)
+            web_recommendations = await self._search_web_recommendations(
+                keywords, content_types, max_items
+            )
+            recommendations.extend(web_recommendations)
+            
+            # 4. 결과 정렬 및 제한
             # 다양성을 위해 키워드별로 균등하게 분배
             final_recommendations = self._balance_recommendations(
                 recommendations, keywords, max_items
             )
             
-            # 추천이 없는 경우 더미 데이터 생성
-            if not final_recommendations:
-                final_recommendations = self._generate_fallback_recommendations(keywords)
+            # 5. 추천이 부족한 경우에만 fallback 데이터 추가
+            if len(final_recommendations) < max_items:
+                fallback_recommendations = self._generate_fallback_recommendations(keywords)
+                final_recommendations.extend(fallback_recommendations)
             
             return {
                 "recommendations": final_recommendations[:max_items]
@@ -79,81 +90,122 @@ class RecommendChain:
         content_types: List[str],
         max_items: int
     ) -> List[Dict]:
-        """DB에서 저장된 추천 검색"""
-        recommendations = []
-        
-        for keyword in keywords:
-            filter_dict = {
-                "keyword": keyword,
+        """저장된 추천에서 검색"""
+        try:
+            # MongoDB 텍스트 검색 사용
+            search_query = " ".join(keywords)
+            
+            cursor = self.recommendations.find({
+                "$text": {"$search": search_query},
                 "content_type": {"$in": content_types}
-            }
+            }).limit(max_items)
             
-            items = await self.recommendations.find(
-                filter_dict
-            ).limit(max_items // len(keywords)).to_list(None)
-            
-            for item in items:
+            recommendations = []
+            async for doc in cursor:
                 recommendations.append({
-                    "title": item["title"],
-                    "content_type": item["content_type"],
-                    "description": item.get("description"),
-                    "source": item["source"],
-                    "metadata": item.get("metadata", {}),
-                    "keyword": keyword,
+                    "title": doc["title"],
+                    "content_type": doc["content_type"],
+                    "description": doc.get("description"),
+                    "source": doc.get("source", "database"),
+                    "metadata": doc.get("metadata", {}),
+                    "keyword": keywords[0] if keywords else "",
                     "recommendation_source": "database"
                 })
-        
-        return recommendations
+            
+            logger.info(f"DB에서 {len(recommendations)}개 추천 검색")
+            return recommendations
+            
+        except Exception as e:
+            logger.warning(f"DB 추천 검색 실패: {e}")
+            return []
 
     async def _search_youtube_recommendations(
         self,
         keywords: List[str],
         max_per_keyword: int
     ) -> List[Dict]:
-        """YouTube에서 실시간 동영상 추천 검색"""
-        youtube_recommendations = []
-        
-        for keyword in keywords:
-            try:
-                # YouTube 검색 실행
-                youtube_videos = await youtube_api.search_videos(
-                    query=keyword,
-                    max_results=max_per_keyword,
-                    order="relevance",
-                    video_duration="medium"  # 중간 길이 동영상 우선
-                )
+        """YouTube에서 실시간 추천 검색"""
+        try:
+            logger.info(f"YouTube API 상태 확인 중...")
+            logger.info(f"YouTube API 사용 가능: {youtube_api.is_available()}")
+            logger.info(f"YouTube API 키 존재: {youtube_api.api_key is not None}")
+            logger.info(f"YouTube 객체 존재: {youtube_api.youtube is not None}")
+            
+            if not youtube_api.is_available():
+                logger.warning("YouTube API를 사용할 수 없습니다.")
+                return []
+            
+            recommendations = []
+            
+            for keyword in keywords:
+                try:
+                    logger.info(f"YouTube에서 '{keyword}' 검색 시작...")
+                    videos = await youtube_api.search_videos(
+                        query=keyword,
+                        max_results=max_per_keyword,
+                        order="relevance"
+                    )
+                    
+                    for video in videos:
+                        recommendations.append({
+                            "title": video["title"],
+                            "content_type": "youtube_video",
+                            "description": video.get("description", "")[:200] + "...",
+                            "source": video["video_url"],
+                            "metadata": {
+                                "channel": video.get("channel_title"),
+                                "duration": video.get("duration"),
+                                "view_count": video.get("view_count", 0),
+                                "thumbnail": video.get("thumbnail_url")
+                            },
+                            "keyword": keyword,
+                            "recommendation_source": "youtube_realtime"
+                        })
+                    
+                    logger.info(f"YouTube에서 '{keyword}' 키워드로 {len(videos)}개 동영상 검색")
+                    
+                except Exception as e:
+                    logger.warning(f"YouTube 검색 실패 (키워드: {keyword}): {e}")
+                    continue
+            
+            return recommendations
+            
+        except Exception as e:
+            logger.error(f"YouTube 추천 검색 실패: {e}")
+            return []
+
+    async def _search_web_recommendations(
+        self,
+        keywords: List[str],
+        content_types: List[str],
+        max_items: int
+    ) -> List[Dict]:
+        """웹 검색 기반 실시간 추천"""
+        try:
+            recommendations = []
+            max_per_type = max(1, max_items // len(content_types))
+            
+            for keyword in keywords[:3]:  # 최대 3개 키워드만 처리
+                # 도서 추천
+                if "book" in content_types:
+                    books = await web_recommendation_engine.search_books(
+                        keyword, max_results=max_per_type
+                    )
+                    recommendations.extend(books)
                 
-                # 결과를 표준 추천 형식으로 변환
-                for video in youtube_videos:
-                    youtube_recommendations.append({
-                        "title": video["title"],
-                        "content_type": "youtube_video",
-                        "description": video["description"],
-                        "source": "youtube",
-                        "metadata": {
-                            "video_id": video["video_id"],
-                            "video_url": video["video_url"],
-                            "channel_title": video["channel_title"],
-                            "channel_id": video["channel_id"],
-                            "thumbnail_url": video["thumbnail_url"],
-                            "view_count": video["view_count"],
-                            "like_count": video["like_count"],
-                            "duration": video["duration"],
-                            "duration_seconds": video["duration_seconds"],
-                            "published_at": video["published_at"],
-                            "tags": video["tags"]
-                        },
-                        "keyword": keyword,
-                        "recommendation_source": "youtube_realtime"
-                    })
-                
-                logger.info(f"YouTube 검색 완료: '{keyword}' - {len(youtube_videos)}개 결과")
-                
-            except Exception as e:
-                logger.error(f"YouTube 검색 실패 (키워드: {keyword}): {e}")
-                continue
-        
-        return youtube_recommendations
+                # 영화 추천  
+                if "movie" in content_types:
+                    movies = await web_recommendation_engine.search_movies(
+                        keyword, max_results=max_per_type
+                    )
+                    recommendations.extend(movies)
+            
+            logger.info(f"웹 검색에서 {len(recommendations)}개 추천 생성")
+            return recommendations
+            
+        except Exception as e:
+            logger.error(f"웹 검색 추천 실패: {e}")
+            return []
 
     def _balance_recommendations(
         self,
@@ -161,62 +213,96 @@ class RecommendChain:
         keywords: List[str],
         max_items: int
     ) -> List[Dict]:
-        """키워드별로 추천을 균등하게 분배"""
-        if not recommendations:
-            return []
-        
-        # 키워드별로 그룹화
-        keyword_groups = {}
-        for rec in recommendations:
-            keyword = rec.get("keyword", "unknown")
-            if keyword not in keyword_groups:
-                keyword_groups[keyword] = []
-            keyword_groups[keyword].append(rec)
-        
-        # 라운드 로빈 방식으로 균등 분배
-        balanced = []
-        max_per_keyword = max(1, max_items // len(keywords)) if keywords else max_items
-        
-        # 각 키워드에서 순서대로 선택
-        for i in range(max_per_keyword):
-            for keyword in keywords:
-                if keyword in keyword_groups and i < len(keyword_groups[keyword]):
-                    balanced.append(keyword_groups[keyword][i])
-                    if len(balanced) >= max_items:
-                        return balanced
-        
-        # 남은 자리가 있으면 추가로 채움
-        for keyword in keywords:
-            if keyword in keyword_groups:
-                for rec in keyword_groups[keyword][max_per_keyword:]:
-                    balanced.append(rec)
+        """콘텐츠 타입별 및 키워드별로 추천을 균등하게 분배"""
+        try:
+            if not recommendations:
+                return []
+            
+            # 1. 콘텐츠 타입별로 그룹화
+            content_type_groups = {}
+            for rec in recommendations:
+                content_type = rec.get("content_type", "기타")
+                if content_type not in content_type_groups:
+                    content_type_groups[content_type] = []
+                content_type_groups[content_type].append(rec)
+            
+            # 2. 각 콘텐츠 타입에서 최대 허용 개수 계산
+            num_content_types = len(content_type_groups)
+            max_per_content_type = max(2, max_items // num_content_types)  # 최소 2개씩 보장
+            
+            balanced = []
+            
+            # 3. 각 콘텐츠 타입에서 균등하게 선택
+            for content_type, group in content_type_groups.items():
+                # 해당 콘텐츠 타입 내에서 키워드별로 균등분배
+                keyword_groups = {}
+                for rec in group:
+                    keyword = rec.get("keyword", "기타")
+                    if keyword not in keyword_groups:
+                        keyword_groups[keyword] = []
+                    keyword_groups[keyword].append(rec)
+                
+                # 키워드별로 균등하게 선택
+                content_type_items = []
+                items_per_keyword = max(1, max_per_content_type // len(keyword_groups))
+                
+                for keyword, keyword_group in keyword_groups.items():
+                    selected = keyword_group[:items_per_keyword]
+                    content_type_items.extend(selected)
+                
+                # 콘텐츠 타입별 최대 개수로 제한
+                content_type_items = content_type_items[:max_per_content_type]
+                balanced.extend(content_type_items)
+                
+                logger.info(f"콘텐츠 타입 '{content_type}': {len(content_type_items)}개 선택")
+            
+            # 4. 남은 자리가 있으면 추가 선택 (다양성 우선)
+            remaining = max_items - len(balanced)
+            if remaining > 0:
+                remaining_items = [rec for rec in recommendations if rec not in balanced]
+                # 콘텐츠 타입별로 순서대로 추가 (다양성 보장)
+                type_rotation = list(content_type_groups.keys())
+                type_index = 0
+                
+                for item in remaining_items:
                     if len(balanced) >= max_items:
                         break
-            if len(balanced) >= max_items:
-                break
-        
-        return balanced
+                    
+                    # 현재 타입이 이미 많이 포함되었는지 확인
+                    current_type = item.get("content_type")
+                    current_type_count = sum(1 for b in balanced if b.get("content_type") == current_type)
+                    
+                    # 타입별 최대 개수를 넘지 않도록 제한
+                    if current_type_count < max_per_content_type + 1:  # +1 여유
+                        balanced.append(item)
+            
+            logger.info(f"균형 조정 완료: 총 {len(balanced)}개 (타입별 균등분배)")
+            
+            # 5. 콘텐츠 타입별 분포 로깅
+            final_distribution = {}
+            for item in balanced:
+                content_type = item.get("content_type", "기타")
+                final_distribution[content_type] = final_distribution.get(content_type, 0) + 1
+            
+            logger.info(f"최종 콘텐츠 타입 분포: {final_distribution}")
+            
+            return balanced[:max_items]
+            
+        except Exception as e:
+            logger.error(f"추천 균등 분배 실패: {e}")
+            return recommendations[:max_items]
 
     def _generate_fallback_recommendations(self, keywords: List[str]) -> List[Dict]:
-        """추천이 없는 경우 기본 추천 생성"""
+        """폴백 추천 생성 (검색 결과가 없을 때)"""
         fallback_recommendations = []
         
-        for keyword in keywords[:3]:  # 최대 3개 키워드까지
+        for keyword in keywords[:5]:  # 최대 5개 키워드만
             fallback_recommendations.extend([
                 {
                     "title": f"{keyword} 관련 도서 추천",
                     "content_type": "book",
-                    "description": f"{keyword}에 관한 유용한 도서를 곧 추천해드릴 예정입니다.",
-                    "source": "internal",
-                    "metadata": {},
-                    "keyword": keyword,
-                    "recommendation_source": "fallback"
-                },
-                {
-                    "title": f"{keyword} 관련 동영상 추천",
-                    "content_type": "video",
-                    "description": f"{keyword}에 관한 교육 동영상을 곧 추천해드릴 예정입니다.",
-                    "source": "internal", 
+                    "description": f"{keyword}에 대해 더 자세히 알 수 있는 도서를 찾아보세요.",
+                    "source": "추천 시스템",
                     "metadata": {},
                     "keyword": keyword,
                     "recommendation_source": "fallback"
@@ -243,177 +329,36 @@ class RecommendChain:
             추출된 키워드 리스트
         """
         try:
-            # 1. 텍스트 수집
-            texts = []
-            
+            # TextCollector를 사용하여 텍스트 수집
+            combined_text = ""
             if file_id:
-                # 특정 파일의 텍스트 수집
-                file_texts = await self._get_file_texts(file_id)
-                texts.extend(file_texts)
+                combined_text = await TextCollector.get_text_from_file(
+                    self.db, file_id, use_chunks=True
+                )
             elif folder_id:
-                # 폴더 내 모든 파일의 텍스트 수집
-                folder_texts = await self._get_folder_texts(folder_id)
-                texts.extend(folder_texts)
+                combined_text = await TextCollector.get_text_from_folder(
+                    self.db, folder_id, use_chunks=True
+                )
             
-            if not texts:
+            if not combined_text.strip():
                 logger.warning(f"텍스트를 찾을 수 없음: file_id={file_id}, folder_id={folder_id}")
                 return []
             
-            # 2. 텍스트 결합
-            combined_text = " ".join(texts)
+            # 텍스트가 너무 긴 경우 제한
+            if len(combined_text) > 5000:
+                combined_text = combined_text[:5000] + "..."
+                logger.info("텍스트가 너무 길어 5000자로 제한했습니다.")
             
-            # 3. OpenAI를 사용한 키워드 추출
-            keywords = await self._extract_keywords_with_ai(combined_text, max_keywords)
+            # AutoLabeler를 사용하여 키워드 추출
+            labeler = AutoLabeler()
+            keywords = await labeler.extract_keywords(
+                text=combined_text,
+                max_keywords=max_keywords
+            )
             
             logger.info(f"키워드 추출 완료: {len(keywords)}개 - {keywords}")
             return keywords
             
         except Exception as e:
             logger.error(f"키워드 추출 실패: {e}")
-            return []
-
-    async def _get_file_texts(self, file_id: str) -> List[str]:
-        """특정 파일의 모든 텍스트 가져오기"""
-        texts = []
-        
-        # chunks 컬렉션에서 해당 파일의 청크들 조회
-        chunks = await self.chunks.find({"file_id": file_id}).to_list(None)
-        
-        if chunks:
-            # 청크가 있으면 청크 텍스트 사용
-            for chunk in chunks:
-                if chunk.get("text"):
-                    texts.append(chunk["text"])
-        else:
-            # 청크가 없으면 documents 컬렉션에서 원본 텍스트 조회
-            docs = await self.documents.find({"file_id": file_id}).to_list(None)
-            for doc in docs:
-                if doc.get("raw_text"):
-                    texts.append(doc["raw_text"])
-                elif doc.get("processed_text"):
-                    texts.append(doc["processed_text"])
-        
-        return texts
-
-    async def _get_folder_texts(self, folder_id: str) -> List[str]:
-        """폴더 내 모든 파일의 텍스트 가져오기"""
-        texts = []
-        
-        # chunks 컬렉션에서 해당 폴더의 모든 청크 조회
-        chunks = await self.chunks.find({"metadata.folder_id": folder_id}).to_list(None)
-        
-        if chunks:
-            # 청크가 있으면 청크 텍스트 사용
-            for chunk in chunks:
-                if chunk.get("text"):
-                    texts.append(chunk["text"])
-        else:
-            # 청크가 없으면 documents 컬렉션에서 조회
-            docs = await self.documents.find({"folder_id": folder_id}).to_list(None)
-            for doc in docs:
-                if doc.get("raw_text"):
-                    texts.append(doc["raw_text"])
-                elif doc.get("processed_text"):
-                    texts.append(doc["processed_text"])
-        
-        return texts
-
-    async def _extract_keywords_with_ai(self, text: str, max_keywords: int) -> List[str]:
-        """
-        OpenAI를 사용하여 텍스트에서 키워드 추출
-        
-        Args:
-            text: 키워드를 추출할 텍스트
-            max_keywords: 추출할 최대 키워드 수
-            
-        Returns:
-            추출된 키워드 리스트
-        """
-        try:
-            import openai
-            from config.settings import get_settings
-            
-            settings = get_settings()
-            
-            # 텍스트가 너무 길면 앞부분만 사용 (토큰 제한)
-            if len(text) > 3000:
-                text = text[:3000] + "..."
-            
-            # OpenAI에 키워드 추출 요청
-            response = await openai.ChatCompletion.acreate(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": f"""당신은 텍스트에서 핵심 키워드를 추출하는 전문가입니다.
-주어진 텍스트를 분석하여 가장 중요하고 의미있는 키워드 {max_keywords}개를 추출해주세요.
-
-규칙:
-1. 단일 단어나 간단한 구문으로 추출
-2. 너무 일반적인 단어는 제외 (예: 것, 하다, 있다)
-3. 고유명사, 전문용어, 주제어 우선
-4. 한국어로 응답
-5. 키워드만 쉼표로 구분해서 나열
-
-예시: 인공지능, 머신러닝, 데이터 분석, 딥러닝, 자연어처리"""
-                    },
-                    {
-                        "role": "user",
-                        "content": f"다음 텍스트에서 핵심 키워드 {max_keywords}개를 추출해주세요:\n\n{text}"
-                    }
-                ],
-                max_tokens=200,
-                temperature=0.3
-            )
-            
-            keywords_text = response.choices[0].message.content.strip()
-            
-            # 쉼표로 분리하고 정리
-            keywords = [kw.strip() for kw in keywords_text.split(',') if kw.strip()]
-            keywords = keywords[:max_keywords]  # 최대 개수 제한
-            
-            if not keywords:
-                # AI 추출 실패시 간단한 방법으로 폴백
-                logger.warning("AI 키워드 추출 실패, 간단한 방법으로 폴백")
-                keywords = self._extract_keywords_simple(text, max_keywords)
-            
-            return keywords
-            
-        except Exception as e:
-            logger.error(f"AI 키워드 추출 실패: {e}")
-            # 폴백: 간단한 키워드 추출
-            return self._extract_keywords_simple(text, max_keywords)
-
-    def _extract_keywords_simple(self, text: str, max_keywords: int) -> List[str]:
-        """
-        간단한 키워드 추출 (AI 실패시 폴백)
-        
-        Args:
-            text: 키워드를 추출할 텍스트
-            max_keywords: 추출할 최대 키워드 수
-            
-        Returns:
-            추출된 키워드 리스트
-        """
-        try:
-            import re
-            from collections import Counter
-            
-            # 한국어 단어 추출 (2글자 이상)
-            korean_words = re.findall(r'[가-힣]{2,}', text)
-            
-            # 불용어 제거
-            stopwords = {'것이', '하는', '있는', '되는', '같은', '통해', '위해', '대한', '관련', '경우', '때문', '따라'}
-            filtered_words = [word for word in korean_words if word not in stopwords]
-            
-            # 빈도 계산
-            word_counts = Counter(filtered_words)
-            
-            # 상위 키워드 선택
-            keywords = [word for word, count in word_counts.most_common(max_keywords)]
-            
-            return keywords
-            
-        except Exception as e:
-            logger.error(f"간단한 키워드 추출도 실패: {e}")
             return []

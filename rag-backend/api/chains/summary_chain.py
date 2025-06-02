@@ -27,10 +27,27 @@ class SummaryChain:
     ) -> Dict:
         """요약 처리"""
         try:
-            # 문서 조회 조건 설정
+            # document_ids 정리 - "string", "null" 같은 기본값 제거
+            clean_document_ids = None
             if document_ids:
-                # document_ids가 제공된 경우, 해당 file_id들을 가진 문서들 찾기
-                filter_dict = {"file_id": {"$in": document_ids}}
+                clean_document_ids = [
+                    doc_id.strip() for doc_id in document_ids 
+                    if doc_id and doc_id.strip() and doc_id.strip() not in ["string", "null"]
+                ]
+                if not clean_document_ids:
+                    clean_document_ids = None
+            
+            # folder_id 정리
+            clean_folder_id = None
+            if folder_id and folder_id.strip() and folder_id.strip() not in ["string", "null"]:
+                clean_folder_id = folder_id.strip()
+            
+            logger.info(f"요약 처리 시작 - document_ids: {clean_document_ids}, folder_id: '{clean_folder_id}'")
+            
+            # 문서 조회 조건 설정
+            if clean_document_ids:
+                # clean_document_ids가 제공된 경우, 해당 file_id들을 가진 문서들 찾기
+                filter_dict = {"file_id": {"$in": clean_document_ids}}
                 documents = await self.documents.find(filter_dict).to_list(None)
                 
                 if not documents:
@@ -55,17 +72,19 @@ class SummaryChain:
                 combined_text = "\n\n".join(texts)
                 document_count = len(documents)
                 
-            elif folder_id:
-                # folder_id가 제공된 경우, 해당 폴더의 모든 청크들 찾기
-                filter_dict = {"file_id": {"$in": []}}
+            elif clean_folder_id:
+                # clean_folder_id가 제공된 경우, 해당 폴더의 모든 청크들 찾기
+                logger.info(f"폴더별 요약 처리: {clean_folder_id}")
                 
                 # 먼저 해당 폴더의 문서들 찾기
-                folder_docs = await self.documents.find({"folder_id": folder_id}).to_list(None)
+                folder_docs = await self.documents.find({"folder_id": clean_folder_id}).to_list(None)
                 if not folder_docs:
                     return {
                         "summary": "요약할 문서가 없습니다.",
                         "document_count": 0
                     }
+                
+                logger.info(f"폴더 '{clean_folder_id}'에서 {len(folder_docs)}개 문서 발견")
                 
                 # 해당 문서들의 file_id 목록 만들기
                 file_ids = [doc["file_id"] for doc in folder_docs]
@@ -79,6 +98,8 @@ class SummaryChain:
                         "document_count": len(folder_docs)
                     }
                 
+                logger.info(f"총 {len(chunks)}개 청크에서 텍스트 추출")
+                
                 # 청크들의 텍스트 결합
                 combined_text = "\n\n".join([chunk["text"] for chunk in chunks])
                 document_count = len(folder_docs)
@@ -91,6 +112,8 @@ class SummaryChain:
                 combined_text = combined_text[:8000] + "..."
                 logger.warning("텍스트가 너무 길어 8000자로 제한했습니다.")
             
+            logger.info(f"요약할 텍스트 길이: {len(combined_text)} 문자")
+            
             # 프롬프트 선택
             if summary_type == "brief":
                 prompt = f"다음 텍스트를 1-2문장으로 간단히 요약해주세요:\n\n{combined_text}"
@@ -101,6 +124,8 @@ class SummaryChain:
             
             # 요약 생성
             summary = await self.llm_client.generate(prompt, max_tokens=500)
+            
+            logger.info(f"요약 완료 - 문서 수: {document_count}, 요약 길이: {len(summary)}")
             
             return {
                 "summary": summary,

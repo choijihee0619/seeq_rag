@@ -97,11 +97,13 @@ async def generate_mindmap(request: MindmapRequest):
             )
             nodes.append(node)
             
-            # 엣지 생성 (루트와 연결)
+            # 엣지 생성 (루트와 연결) - 가중치 개선
+            # 키워드 순서에 따라 1.0에서 0.2까지 선형적으로 감소
+            weight = max(0.2, 1.0 - (i * 0.05))  # 음수 방지 및 최소값 보장
             edge = MindmapEdge(
                 source="root",
                 target=node_id,
-                weight=1.0 - (i * 0.1)  # 순서에 따라 가중치 감소
+                weight=weight
             )
             edges.append(edge)
         
