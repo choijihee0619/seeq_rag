@@ -1,0 +1,36 @@
+# 핵심 의존성
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic==2.5.3
+python-multipart==0.0.6
+
+# LangChain 관련
+langchain==0.1.5
+langchain-openai==0.0.5
+langchain-community==0.0.17  # 0.0.16 -> 0.0.17로 업그레이드 (의존성 충돌 해결)
+langserve==0.0.39
+
+# OpenAI
+openai==1.10.0
+
+# MongoDB
+pymongo==4.6.1
+motor==3.3.2
+
+# 유틸리티
+python-dotenv==1.0.0
+aiofiles==23.2.1
+pandas==2.1.4
+numpy==1.26.3
+
+# 문서 처리
+pypdf==3.17.4
+python-docx==1.1.0
+beautifulsoup4==4.12.3
+
+# 로깅 및 모니터링
+loguru==0.7.2
+
+# 테스트
+pytest==7.4.4
+pytest-asyncio==0.23.3 
