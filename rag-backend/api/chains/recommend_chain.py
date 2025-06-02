@@ -2,8 +2,10 @@
 추천 체인
 콘텐츠 추천 생성
 MODIFIED 2024-01-20: YouTube API 연동 추가 - 실시간 YouTube 동영상 추천 기능 통합
+ENHANCED 2024-01-21: 파일 기반 키워드 자동 추출 기능 추가
+CLEANED 2024-01-21: 불필요한 YouTube 개별 API 제거, 핵심 추천 기능만 유지
 """
-from typing import Dict, List
+from typing import Dict, List, Optional
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from utils.logger import get_logger
 from utils.youtube_api import youtube_api
@@ -16,6 +18,8 @@ class RecommendChain:
     def __init__(self, db: AsyncIOMotorDatabase):
         self.db = db
         self.recommendations = db.recommendations
+        self.documents = db.documents  # documents 컬렉션 추가
+        self.chunks = db.chunks        # chunks 컬렉션 추가
     
     async def process(
         self,
@@ -221,82 +225,195 @@ class RecommendChain:
         
         return fallback_recommendations
 
-    async def save_youtube_recommendation(
+    async def extract_keywords_from_file(
         self,
-        keyword: str,
-        video_info: Dict
-    ) -> bool:
+        file_id: Optional[str] = None,
+        folder_id: Optional[str] = None,
+        max_keywords: int = 5
+    ) -> List[str]:
         """
-        YouTube 추천을 DB에 저장 (캐싱 목적)
+        업로드된 파일이나 폴더에서 키워드를 자동 추출
         
         Args:
-            keyword: 검색 키워드
-            video_info: YouTube 동영상 정보
+            file_id: 특정 파일 ID
+            folder_id: 폴더 ID (해당 폴더의 모든 파일에서 키워드 추출)
+            max_keywords: 추출할 최대 키워드 수
+            
+        Returns:
+            추출된 키워드 리스트
         """
         try:
-            recommendation_doc = {
-                "keyword": keyword,
-                "content_type": "youtube_video",
-                "content_id": video_info["video_id"],
-                "title": video_info["title"],
-                "description": video_info["description"],
-                "source": "youtube",
-                "metadata": video_info
-            }
+            # 1. 텍스트 수집
+            texts = []
             
-            # 중복 체크 (같은 키워드 + 동영상 ID)
-            existing = await self.recommendations.find_one({
-                "keyword": keyword,
-                "content_id": video_info["video_id"],
-                "source": "youtube"
-            })
+            if file_id:
+                # 특정 파일의 텍스트 수집
+                file_texts = await self._get_file_texts(file_id)
+                texts.extend(file_texts)
+            elif folder_id:
+                # 폴더 내 모든 파일의 텍스트 수집
+                folder_texts = await self._get_folder_texts(folder_id)
+                texts.extend(folder_texts)
             
-            if not existing:
-                await self.recommendations.insert_one(recommendation_doc)
-                logger.info(f"YouTube 추천 저장: {keyword} - {video_info['title']}")
-                return True
+            if not texts:
+                logger.warning(f"텍스트를 찾을 수 없음: file_id={file_id}, folder_id={folder_id}")
+                return []
             
-            return False
+            # 2. 텍스트 결합
+            combined_text = " ".join(texts)
+            
+            # 3. OpenAI를 사용한 키워드 추출
+            keywords = await self._extract_keywords_with_ai(combined_text, max_keywords)
+            
+            logger.info(f"키워드 추출 완료: {len(keywords)}개 - {keywords}")
+            return keywords
             
         except Exception as e:
-            logger.error(f"YouTube 추천 저장 실패: {e}")
-            return False
+            logger.error(f"키워드 추출 실패: {e}")
+            return []
 
-    async def get_youtube_trending(
-        self,
-        category_id: str = "0",  # 전체 카테고리
-        max_results: int = 10
-    ) -> List[Dict]:
+    async def _get_file_texts(self, file_id: str) -> List[str]:
+        """특정 파일의 모든 텍스트 가져오기"""
+        texts = []
+        
+        # chunks 컬렉션에서 해당 파일의 청크들 조회
+        chunks = await self.chunks.find({"file_id": file_id}).to_list(None)
+        
+        if chunks:
+            # 청크가 있으면 청크 텍스트 사용
+            for chunk in chunks:
+                if chunk.get("text"):
+                    texts.append(chunk["text"])
+        else:
+            # 청크가 없으면 documents 컬렉션에서 원본 텍스트 조회
+            docs = await self.documents.find({"file_id": file_id}).to_list(None)
+            for doc in docs:
+                if doc.get("raw_text"):
+                    texts.append(doc["raw_text"])
+                elif doc.get("processed_text"):
+                    texts.append(doc["processed_text"])
+        
+        return texts
+
+    async def _get_folder_texts(self, folder_id: str) -> List[str]:
+        """폴더 내 모든 파일의 텍스트 가져오기"""
+        texts = []
+        
+        # chunks 컬렉션에서 해당 폴더의 모든 청크 조회
+        chunks = await self.chunks.find({"metadata.folder_id": folder_id}).to_list(None)
+        
+        if chunks:
+            # 청크가 있으면 청크 텍스트 사용
+            for chunk in chunks:
+                if chunk.get("text"):
+                    texts.append(chunk["text"])
+        else:
+            # 청크가 없으면 documents 컬렉션에서 조회
+            docs = await self.documents.find({"folder_id": folder_id}).to_list(None)
+            for doc in docs:
+                if doc.get("raw_text"):
+                    texts.append(doc["raw_text"])
+                elif doc.get("processed_text"):
+                    texts.append(doc["processed_text"])
+        
+        return texts
+
+    async def _extract_keywords_with_ai(self, text: str, max_keywords: int) -> List[str]:
         """
-        YouTube 인기 동영상 가져오기
+        OpenAI를 사용하여 텍스트에서 키워드 추출
         
         Args:
-            category_id: 카테고리 ID (0: 전체)
-            max_results: 최대 결과 수
+            text: 키워드를 추출할 텍스트
+            max_keywords: 추출할 최대 키워드 수
+            
+        Returns:
+            추출된 키워드 리스트
         """
         try:
-            # YouTube API로 인기 동영상 검색
-            # 실제로는 trending API를 사용해야 하지만, 여기서는 인기도 기반 검색으로 대체
-            trending_videos = await youtube_api.search_videos(
-                query="인기",  # 한국어 인기 키워드
-                max_results=max_results,
-                order="viewCount"  # 조회수 순 정렬
+            import openai
+            from config.settings import get_settings
+            
+            settings = get_settings()
+            
+            # 텍스트가 너무 길면 앞부분만 사용 (토큰 제한)
+            if len(text) > 3000:
+                text = text[:3000] + "..."
+            
+            # OpenAI에 키워드 추출 요청
+            response = await openai.ChatCompletion.acreate(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": f"""당신은 텍스트에서 핵심 키워드를 추출하는 전문가입니다.
+주어진 텍스트를 분석하여 가장 중요하고 의미있는 키워드 {max_keywords}개를 추출해주세요.
+
+규칙:
+1. 단일 단어나 간단한 구문으로 추출
+2. 너무 일반적인 단어는 제외 (예: 것, 하다, 있다)
+3. 고유명사, 전문용어, 주제어 우선
+4. 한국어로 응답
+5. 키워드만 쉼표로 구분해서 나열
+
+예시: 인공지능, 머신러닝, 데이터 분석, 딥러닝, 자연어처리"""
+                    },
+                    {
+                        "role": "user",
+                        "content": f"다음 텍스트에서 핵심 키워드 {max_keywords}개를 추출해주세요:\n\n{text}"
+                    }
+                ],
+                max_tokens=200,
+                temperature=0.3
             )
             
-            recommendations = []
-            for video in trending_videos:
-                recommendations.append({
-                    "title": video["title"],
-                    "content_type": "youtube_video",
-                    "description": video["description"],
-                    "source": "youtube_trending",
-                    "metadata": video,
-                    "keyword": "trending",
-                    "recommendation_source": "youtube_trending"
-                })
+            keywords_text = response.choices[0].message.content.strip()
             
-            return recommendations
+            # 쉼표로 분리하고 정리
+            keywords = [kw.strip() for kw in keywords_text.split(',') if kw.strip()]
+            keywords = keywords[:max_keywords]  # 최대 개수 제한
+            
+            if not keywords:
+                # AI 추출 실패시 간단한 방법으로 폴백
+                logger.warning("AI 키워드 추출 실패, 간단한 방법으로 폴백")
+                keywords = self._extract_keywords_simple(text, max_keywords)
+            
+            return keywords
             
         except Exception as e:
-            logger.error(f"YouTube 인기 동영상 조회 실패: {e}")
+            logger.error(f"AI 키워드 추출 실패: {e}")
+            # 폴백: 간단한 키워드 추출
+            return self._extract_keywords_simple(text, max_keywords)
+
+    def _extract_keywords_simple(self, text: str, max_keywords: int) -> List[str]:
+        """
+        간단한 키워드 추출 (AI 실패시 폴백)
+        
+        Args:
+            text: 키워드를 추출할 텍스트
+            max_keywords: 추출할 최대 키워드 수
+            
+        Returns:
+            추출된 키워드 리스트
+        """
+        try:
+            import re
+            from collections import Counter
+            
+            # 한국어 단어 추출 (2글자 이상)
+            korean_words = re.findall(r'[가-힣]{2,}', text)
+            
+            # 불용어 제거
+            stopwords = {'것이', '하는', '있는', '되는', '같은', '통해', '위해', '대한', '관련', '경우', '때문', '따라'}
+            filtered_words = [word for word in korean_words if word not in stopwords]
+            
+            # 빈도 계산
+            word_counts = Counter(filtered_words)
+            
+            # 상위 키워드 선택
+            keywords = [word for word, count in word_counts.most_common(max_keywords)]
+            
+            return keywords
+            
+        except Exception as e:
+            logger.error(f"간단한 키워드 추출도 실패: {e}")
             return []

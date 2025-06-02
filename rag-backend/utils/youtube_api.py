@@ -1,14 +1,20 @@
 """
 YouTube API 연동 모듈
 MODIFIED 2024-01-20: YouTube 동영상 검색 및 메타데이터 수집 기능 추가
+FIXED 2024-01-20: 동기/비동기 처리 오류 수정, 예외 처리 개선
 """
 import os
 import asyncio
 from typing import List, Dict, Optional
+from concurrent.futures import ThreadPoolExecutor
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 import httpx
+from dotenv import load_dotenv
 from utils.logger import get_logger
+
+# 환경변수 로드
+load_dotenv()
 
 logger = get_logger(__name__)
 
@@ -23,13 +29,22 @@ class YouTubeAPI:
             api_key: YouTube Data API v3 키
         """
         self.api_key = api_key or os.getenv("YOUTUBE_API_KEY")
+        
+        # 디버깅 정보 출력
+        logger.info(f"YouTube API 키 초기화 - 제공된 키: {'있음' if api_key else '없음'}")
+        logger.info(f"환경변수에서 로드된 키: {'있음' if os.getenv('YOUTUBE_API_KEY') else '없음'}")
+        
         if not self.api_key:
             logger.warning("YouTube API 키가 설정되지 않았습니다. 환경변수 YOUTUBE_API_KEY를 확인하세요.")
+            logger.warning("현재 .env 파일 위치에서 환경변수를 다시 로드합니다.")
         
         self.youtube = None
+        self.executor = ThreadPoolExecutor(max_workers=3)  # 동기 API 호출용 스레드 풀
+        
         if self.api_key:
             try:
                 self.youtube = build('youtube', 'v3', developerKey=self.api_key)
+                logger.info("YouTube API 초기화 완료")
             except Exception as e:
                 logger.error(f"YouTube API 초기화 실패: {e}")
 
@@ -59,57 +74,81 @@ class YouTubeAPI:
             return []
         
         try:
-            # 동영상 검색 실행
-            search_request = self.youtube.search().list(
-                q=query,
-                part='id,snippet',
-                maxResults=min(max_results, 50),  # API 제한
-                order=order,
-                type='video',
-                videoDuration=video_duration,
-                regionCode='KR',  # 한국 지역 설정
-                relevanceLanguage='ko'  # 한국어 우선
+            # 동기 API 호출을 비동기로 실행
+            loop = asyncio.get_event_loop()
+            search_result = await loop.run_in_executor(
+                self.executor,
+                self._sync_search_videos,
+                query, max_results, order, video_duration, video_category_id
             )
             
-            # 카테고리 필터 추가
-            if video_category_id:
-                search_request = search_request.execute()
-                # 상세 정보에서 카테고리 필터링 필요
-            else:
-                search_request = search_request.execute()
+            if not search_result:
+                return []
             
+            video_ids = [item['id']['videoId'] for item in search_result.get('items', [])]
+            
+            if not video_ids:
+                return []
+            
+            # 상세 정보 가져오기
+            videos_details = await loop.run_in_executor(
+                self.executor,
+                self._sync_get_video_details,
+                video_ids
+            )
+            
+            # 결과 정리
             videos = []
-            video_ids = []
-            
-            # 비디오 ID 수집
-            for item in search_request.get('items', []):
-                video_ids.append(item['id']['videoId'])
-            
-            # 상세 정보 가져오기 (통계, 지속시간 등)
-            if video_ids:
-                videos_details = self.youtube.videos().list(
-                    part='snippet,statistics,contentDetails',
-                    id=','.join(video_ids)
-                ).execute()
-                
-                # 결과 정리
-                for item in videos_details.get('items', []):
-                    video_info = await self._parse_video_info(item)
-                    if video_info:
-                        videos.append(video_info)
+            for item in videos_details.get('items', []):
+                video_info = self._parse_video_info(item)  # 동기 함수로 변경
+                if video_info:
+                    videos.append(video_info)
             
             logger.info(f"YouTube 검색 완료: '{query}' - {len(videos)}개 결과")
             return videos
             
         except HttpError as e:
-            logger.error(f"YouTube API 요청 실패: {e}")
+            error_reason = getattr(e, 'reason', 'Unknown error')
+            logger.error(f"YouTube API 요청 실패: {error_reason}")
             return []
         except Exception as e:
             logger.error(f"YouTube 검색 중 오류: {e}")
             return []
 
-    async def _parse_video_info(self, item: Dict) -> Optional[Dict]:
-        """YouTube API 응답을 파싱하여 정리된 동영상 정보 반환"""
+    def _sync_search_videos(
+        self, 
+        query: str, 
+        max_results: int, 
+        order: str, 
+        video_duration: str,
+        video_category_id: Optional[str]
+    ) -> Dict:
+        """동기 방식 동영상 검색"""
+        search_request = self.youtube.search().list(
+            q=query,
+            part='id,snippet',
+            maxResults=min(max_results, 50),  # API 제한
+            order=order,
+            type='video',
+            videoDuration=video_duration,
+            regionCode='KR',  # 한국 지역 설정
+            relevanceLanguage='ko'  # 한국어 우선
+        )
+        
+        if video_category_id:
+            search_request = search_request.list(videoCategoryId=video_category_id)
+        
+        return search_request.execute()
+
+    def _sync_get_video_details(self, video_ids: List[str]) -> Dict:
+        """동기 방식 동영상 상세 정보 조회"""
+        return self.youtube.videos().list(
+            part='snippet,statistics,contentDetails',
+            id=','.join(video_ids)
+        ).execute()
+
+    def _parse_video_info(self, item: Dict) -> Optional[Dict]:
+        """YouTube API 응답을 파싱하여 정리된 동영상 정보 반환 (동기 함수로 변경)"""
         try:
             snippet = item.get('snippet', {})
             statistics = item.get('statistics', {})
@@ -217,10 +256,12 @@ class YouTubeAPI:
             return {}
         
         try:
-            response = self.youtube.videoCategories().list(
-                part='snippet',
-                regionCode=region_code
-            ).execute()
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                self.executor,
+                self._sync_get_categories,
+                region_code
+            )
             
             categories = {}
             for item in response.get('items', []):
@@ -231,6 +272,13 @@ class YouTubeAPI:
         except Exception as e:
             logger.error(f"카테고리 조회 실패: {e}")
             return {}
+
+    def _sync_get_categories(self, region_code: str) -> Dict:
+        """동기 방식 카테고리 조회"""
+        return self.youtube.videoCategories().list(
+            part='snippet',
+            regionCode=region_code
+        ).execute()
 
     async def search_by_channel(
         self,
@@ -253,17 +301,16 @@ class YouTubeAPI:
             return []
         
         try:
-            search_request = self.youtube.search().list(
-                channelId=channel_id,
-                part='id,snippet',
-                maxResults=min(max_results, 50),
-                order=order,
-                type='video'
-            ).execute()
+            loop = asyncio.get_event_loop()
+            search_result = await loop.run_in_executor(
+                self.executor,
+                self._sync_search_by_channel,
+                channel_id, max_results, order
+            )
             
             videos = []
-            for item in search_request.get('items', []):
-                video_info = await self._parse_video_info(item)
+            for item in search_result.get('items', []):
+                video_info = self._parse_video_info(item)
                 if video_info:
                     videos.append(video_info)
             
@@ -272,6 +319,21 @@ class YouTubeAPI:
         except Exception as e:
             logger.error(f"채널 검색 실패: {e}")
             return []
+
+    def _sync_search_by_channel(self, channel_id: str, max_results: int, order: str) -> Dict:
+        """동기 방식 채널 검색"""
+        return self.youtube.search().list(
+            channelId=channel_id,
+            part='id,snippet',
+            maxResults=min(max_results, 50),
+            order=order,
+            type='video'
+        ).execute()
+
+    def __del__(self):
+        """소멸자 - 스레드 풀 정리"""
+        if hasattr(self, 'executor'):
+            self.executor.shutdown(wait=False)
 
 # 싱글톤 인스턴스
 youtube_api = YouTubeAPI() 

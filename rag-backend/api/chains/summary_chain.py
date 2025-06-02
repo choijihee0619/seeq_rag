@@ -6,6 +6,7 @@ from typing import Dict, List, Optional
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from ai_processing.llm_client import LLMClient
 from utils.logger import get_logger
+from bson import ObjectId
 
 logger = get_logger(__name__)
 
@@ -16,6 +17,7 @@ class SummaryChain:
         self.db = db
         self.llm_client = LLMClient()
         self.documents = db.documents
+        self.chunks = db.chunks
     
     async def process(
         self,
@@ -25,25 +27,69 @@ class SummaryChain:
     ) -> Dict:
         """요약 처리"""
         try:
-            # 문서 조회
-            filter_dict = {}
+            # 문서 조회 조건 설정
             if document_ids:
-                filter_dict["_id"] = {"$in": document_ids}
+                # document_ids가 제공된 경우, 해당 file_id들을 가진 문서들 찾기
+                filter_dict = {"file_id": {"$in": document_ids}}
+                documents = await self.documents.find(filter_dict).to_list(None)
+                
+                if not documents:
+                    return {
+                        "summary": "요약할 문서가 없습니다.",
+                        "document_count": 0
+                    }
+                
+                # 해당 문서들의 텍스트 사용 (processed_text 또는 raw_text)
+                texts = []
+                for doc in documents:
+                    text = doc.get("processed_text", doc.get("raw_text", ""))
+                    if text:
+                        texts.append(text)
+                
+                if not texts:
+                    return {
+                        "summary": "요약할 텍스트가 없습니다.",
+                        "document_count": len(documents)
+                    }
+                
+                combined_text = "\n\n".join(texts)
+                document_count = len(documents)
+                
             elif folder_id:
-                filter_dict["folder_id"] = folder_id
+                # folder_id가 제공된 경우, 해당 폴더의 모든 청크들 찾기
+                filter_dict = {"file_id": {"$in": []}}
+                
+                # 먼저 해당 폴더의 문서들 찾기
+                folder_docs = await self.documents.find({"folder_id": folder_id}).to_list(None)
+                if not folder_docs:
+                    return {
+                        "summary": "요약할 문서가 없습니다.",
+                        "document_count": 0
+                    }
+                
+                # 해당 문서들의 file_id 목록 만들기
+                file_ids = [doc["file_id"] for doc in folder_docs]
+                
+                # 해당 file_id들의 청크들 찾기
+                chunks = await self.chunks.find({"file_id": {"$in": file_ids}}).sort("sequence", 1).to_list(None)
+                
+                if not chunks:
+                    return {
+                        "summary": "요약할 청크가 없습니다.",
+                        "document_count": len(folder_docs)
+                    }
+                
+                # 청크들의 텍스트 결합
+                combined_text = "\n\n".join([chunk["text"] for chunk in chunks])
+                document_count = len(folder_docs)
+                
             else:
-                raise ValueError("document_ids 또는 folder_id 필요")
+                raise ValueError("document_ids 또는 folder_id가 필요합니다.")
             
-            documents = await self.documents.find(filter_dict).to_list(None)
-            
-            if not documents:
-                return {
-                    "summary": "요약할 문서가 없습니다.",
-                    "document_count": 0
-                }
-            
-            # 텍스트 결합
-            combined_text = "\n\n".join([doc["text"] for doc in documents])
+            # 텍스트가 너무 긴 경우 제한
+            if len(combined_text) > 8000:  # 토큰 제한 고려
+                combined_text = combined_text[:8000] + "..."
+                logger.warning("텍스트가 너무 길어 8000자로 제한했습니다.")
             
             # 프롬프트 선택
             if summary_type == "brief":
@@ -58,7 +104,7 @@ class SummaryChain:
             
             return {
                 "summary": summary,
-                "document_count": len(documents)
+                "document_count": document_count
             }
             
         except Exception as e:

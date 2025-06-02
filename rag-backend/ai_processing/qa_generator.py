@@ -3,7 +3,7 @@ QA 생성 모듈
 LLM을 사용한 질문-답변 쌍 및 퀴즈 생성
 MODIFIED 2024-12-19: models 의존성 제거하여 단순화
 """
-from typing import List, Dict
+from typing import List, Dict, Optional
 import json
 from ai_processing.llm_client import LLMClient
 from utils.logger import get_logger
@@ -55,10 +55,23 @@ class QAGenerator:
     async def generate_quiz(
         self,
         text: str,
-        quiz_type: str = "multiple_choice"
+        quiz_type: str = "multiple_choice",
+        difficulty: Optional[str] = None
     ) -> Dict:
         """퀴즈 생성"""
-        prompt = f"""다음 텍스트를 읽고 객관식 퀴즈를 생성해주세요.
+        
+        # 텍스트 길이 체크
+        if not text or len(text.strip()) < 50:
+            logger.warning("텍스트가 너무 짧아 퀴즈 생성을 건너뜁니다.")
+            return {}
+        
+        # 텍스트가 너무 긴 경우 제한
+        if len(text) > 2000:
+            text = text[:2000] + "..."
+        
+        difficulty_prompt = f" 난이도는 {difficulty}로 설정해주세요." if difficulty else ""
+        
+        prompt = f"""다음 텍스트를 읽고 객관식 퀴즈를 생성해주세요.{difficulty_prompt}
 
 텍스트:
 {text}
@@ -69,9 +82,10 @@ class QAGenerator:
     "options": ["선택지1", "선택지2", "선택지3", "선택지4"],
     "correct_option": 0,
     "explanation": "정답 설명",
-    "difficulty": "easy|medium|hard 중 하나"
+    "difficulty": "{difficulty or 'medium'}"
 }}
-"""
+
+중요: 반드시 유효한 JSON 형식으로만 응답하세요."""
         
         try:
             response = await self.llm_client.generate(
@@ -80,9 +94,30 @@ class QAGenerator:
                 max_tokens=400
             )
             
-            # JSON 파싱
-            quiz = json.loads(response)
-            return quiz
+            # JSON 파싱 시도
+            try:
+                quiz = json.loads(response.strip())
+                
+                # 필수 필드 검증
+                required_fields = ["question", "options", "correct_option"]
+                if all(field in quiz for field in required_fields):
+                    # 기본값 설정
+                    if "difficulty" not in quiz:
+                        quiz["difficulty"] = difficulty or "medium"
+                    if "explanation" not in quiz:
+                        quiz["explanation"] = "설명이 제공되지 않았습니다."
+                    
+                    logger.info("퀴즈 생성 성공")
+                    return quiz
+                else:
+                    logger.warning(f"필수 필드 누락: {required_fields}")
+                    return {}
+                    
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON 파싱 실패: {e}")
+                logger.error(f"LLM 응답: {response}")
+                return {}
+            
         except Exception as e:
             logger.error(f"퀴즈 생성 실패: {e}")
             return {}

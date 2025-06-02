@@ -64,8 +64,10 @@ class QueryChain:
                 "answer": answer,
                 "sources": [
                     {
-                        "text": result["document"]["text"][:200] + "...",
-                        "score": result["score"]
+                        "text": result.get("chunk", {}).get("text", "")[:200] + "...",
+                        "score": result["score"],
+                        "filename": result.get("document", {}).get("original_filename", "알 수 없는 파일"),
+                        "chunk_id": result.get("chunk", {}).get("chunk_id", "")
                     }
                     for result in search_results
                 ],

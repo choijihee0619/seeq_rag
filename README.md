@@ -124,6 +124,7 @@ MONGODB_DB_NAME=rag_database
 ### 2. 의존성 설치
 ```bash
 pip install -r requirements.txt
+pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib httpx
 ```
 
 ### 3. 서버 실행
@@ -195,6 +196,17 @@ Content-Type: application/json
 ```
 
 ### 6. 콘텐츠 추천
+```http
+POST /recommend
+Content-Type: application/json
+
+{
+  "keywords": ["키워드1", "키워드2"],
+  "content_types": ["book", "movie"]
+}
+```
+
+### 7. 콘텐츠 추천
 ```http
 POST /recommend
 Content-Type: application/json
@@ -480,10 +492,77 @@ MONGODB_DB_NAME=seeq_rag
 
 ### **5단계: 키워드 추출** 🏷️
 
-#### **POST /keywords/** - 텍스트 키워드 추출
+#### **A. POST /keywords/from-file** - 파일에서 키워드 추출 ⭐
 ```
-🎯 목적: 텍스트에서 주요 키워드 자동 추출
+🎯 목적: 데이터베이스에 저장된 파일에서 주요 키워드 자동 추출
+📍 위치: Swagger UI > Keywords > POST /keywords/from-file
+
+✨ 이 기능이 더 실용적입니다! 업로드된 문서에서 자동으로 키워드를 추출합니다.
+
+테스트 절차:
+1. 먼저 파일을 업로드하고 file_id 확인
+2. "Try it out" 버튼 클릭
+3. Request body 입력:
+```
+
+**특정 파일에서 키워드 추출:**
+```json
+{
+  "file_id": "e3b4ffab-4bd0-4fa0-8a94-862b138d6b41",
+  "max_keywords": 10,
+  "use_chunks": true
+}
+```
+
+**폴더 전체에서 키워드 추출:**
+```json
+{
+  "folder_id": "test_folder",
+  "max_keywords": 15,
+  "use_chunks": true
+}
+```
+
+**옵션 설명:**
+- **file_id**: 특정 파일의 고유 ID (file_id 또는 folder_id 중 하나 필수)
+- **folder_id**: 폴더 ID (해당 폴더의 모든 파일에서 키워드 추출)
+- **max_keywords**: 추출할 최대 키워드 수 (기본값: 10)
+- **use_chunks**: 
+  - `true`: 청크 단위로 분할된 텍스트에서 추출 (더 정확, 권장)
+  - `false`: 원본 문서 전체에서 추출 (더 포괄적)
+
+**응답 예시:**
+```json
+{
+  "keywords": ["데이터 모델링", "엔터티", "관계", "속성", "정규화", "SQL", "데이터베이스", "식별자", "ERD", "트랜잭션"],
+  "count": 10,
+  "source_info": {
+    "file_id": "e3b4ffab-4bd0-4fa0-8a94-862b138d6b41",
+    "source_type": "chunks",
+    "chunk_count": 27
+  }
+}
+```
+
+#### **B. POST /keywords/from-folder** - 간단한 폴더 키워드 추출
+```
+🎯 목적: URL 파라미터로 간단하게 폴더에서 키워드 추출
+📍 위치: Swagger UI > Keywords > POST /keywords/from-folder
+
+테스트 절차:
+1. "Try it out" 버튼 클릭
+2. Query Parameters 입력:
+   - folder_id: "test_folder"
+   - max_keywords: 10
+   - use_chunks: true
+```
+
+#### **C. POST /keywords/** - 직접 텍스트에서 키워드 추출
+```
+🎯 목적: 사용자가 입력한 텍스트에서 주요 키워드 자동 추출
 📍 위치: Swagger UI > Keywords > POST /keywords/
+
+💡 사용 시나리오: 외부 텍스트나 임시 텍스트에서 키워드를 추출하고 싶을 때
 
 테스트 절차:
 1. "Try it out" 버튼 클릭
@@ -495,6 +574,15 @@ MONGODB_DB_NAME=seeq_rag
 {
   "text": "SQL은 Structured Query Language의 줄임말로, 관계형 데이터베이스에서 데이터를 관리하기 위한 프로그래밍 언어입니다. SELECT, INSERT, UPDATE, DELETE 등의 명령어를 사용하여 데이터를 조작할 수 있습니다.",
   "max_keywords": 10
+}
+```
+
+**응답 예시:**
+```json
+{
+  "keywords": ["SQL", "데이터베이스", "프로그래밍", "언어", "SELECT"],
+  "count": 5,
+  "source_info": null
 }
 ```
 
@@ -522,45 +610,251 @@ MONGODB_DB_NAME=seeq_rag
 
 ### **7단계: 콘텐츠 추천** 💡
 
-#### **POST /recommend/** - 관련 콘텐츠 추천
+#### **🚀 NEW! POST /recommend/from-file** - 업로드된 파일 기반 자동 추천 (권장)
 ```
-🎯 목적: 키워드 기반 학습 콘텐츠 추천
-📍 위치: Swagger UI > Recommend > POST /recommend/
+🎯 목적: 업로드된 파일의 내용을 자동 분석하여 관련 학습 콘텐츠 추천
+📍 위치: Swagger UI > Recommend > POST /recommend/from-file
+
+✨ 이것이 바로 원하는 기능입니다! 파일을 업로드하면 자동으로 키워드를 추출하고 관련 콘텐츠를 추천합니다.
 
 테스트 절차:
-1. "Try it out" 버튼 클릭
-2. Request body 입력:
+1. 먼저 파일을 업로드하고 file_id 확인 (POST /upload/)
+2. "Try it out" 버튼 클릭
+3. Request body 작성
 ```
 
-**Request Body 예시:**
+#### **자동 추천 테스트 예시:**
+
+**📚 1. 특정 파일 기반 자동 추천**
 ```json
 {
-  "keywords": ["SQL", "데이터베이스", "프로그래밍"],
-  "content_types": ["book", "video", "article"],
-  "max_items": 10
+  "file_id": "e3b4ffab-4bd0-4fa0-8a94-862b138d6b41",
+  "content_types": ["book", "youtube_video", "article"],
+  "max_items": 10,
+  "include_youtube": true,
+  "youtube_max_per_keyword": 3,
+  "max_keywords": 5
 }
 ```
 
-**content_types 옵션:**
-- `"book"`: 도서
-- `"movie"`: 영화  
-- `"video"`: 동영상
-- `"article"`: 아티클
-
-### **8단계: 파일 관리** 🗂️
-
-#### **DELETE /upload/{file_id}** - 파일 삭제
+**📁 2. 폴더 전체 기반 자동 추천**
+```json
+{
+  "folder_id": "programming_docs",
+  "content_types": ["book", "youtube_video", "movie"],
+  "max_items": 15,
+  "include_youtube": true,
+  "youtube_max_per_keyword": 4,
+  "max_keywords": 7
+}
 ```
-🎯 목적: 업로드된 파일과 관련 데이터 삭제
-📍 위치: Swagger UI > Upload > DELETE /upload/{file_id}
 
-⚠️ 주의: 삭제된 파일은 복구할 수 없습니다!
+**🎥 3. YouTube 중심 자동 추천**
+```json
+{
+  "file_id": "data_science_paper.pdf",
+  "content_types": ["youtube_video"],
+  "max_items": 20,
+  "include_youtube": true,
+  "youtube_max_per_keyword": 5,
+  "max_keywords": 6
+}
+```
+
+**📖 4. 도서 중심 자동 추천**
+```json
+{
+  "folder_id": "business_analysis",
+  "content_types": ["book"],
+  "max_items": 8,
+  "include_youtube": false,
+  "max_keywords": 4
+}
+```
+
+#### **예상 응답 구조:**
+```json
+{
+  "recommendations": [
+    {
+      "title": "파이썬 완전 정복 - 기초부터 실무까지",
+      "content_type": "book",
+      "description": "초보자를 위한 Python 프로그래밍 완벽 가이드",
+      "source": "교보문고",
+      "metadata": {
+        "author": "홍길동",
+        "publisher": "프로그래밍 출판사",
+        "rating": 4.5
+      },
+      "keyword": "Python",
+      "recommendation_source": "database"
+    },
+    {
+      "title": "Python 머신러닝 강의 - 1시간 완성",
+      "content_type": "youtube_video",
+      "description": "Python을 활용한 머신러닝 기초 강의",
+      "source": "https://youtube.com/watch?v=...",
+      "metadata": {
+        "video_id": "abc123",
+        "channel_title": "코딩 교육 채널",
+        "view_count": 150000,
+        "duration": "1:05:30"
+      },
+      "keyword": "머신러닝",
+      "recommendation_source": "youtube_realtime"
+    }
+  ],
+  "total_count": 15,
+  "youtube_included": true,
+  "sources_summary": {
+    "database": 8,
+    "youtube_realtime": 7
+  },
+  "extracted_keywords": ["Python", "머신러닝", "데이터 분석", "FastAPI", "프로그래밍"]
+}
+```
+
+#### **🎯 실전 활용 시나리오:**
+
+**시나리오 1: 논문 기반 학습 자료 추천**
+1. 연구 논문 PDF 업로드
+2. `/recommend/from-file`로 자동 추천 요청
+3. 논문 주제 관련 YouTube 강의, 교재, 참고 도서 자동 추천
+4. 추출된 키워드 확인으로 학습 방향 설정
+
+**시나리오 2: 프로젝트 문서 기반 스킬업**
+1. 프로젝트 명세서나 기술 문서 업로드
+2. 필요 기술 스택 자동 분석
+3. 관련 온라인 강의, 튜토리얼, 도서 추천
+4. 개발 역량 향상을 위한 학습 경로 제안
+
+**시나리오 3: 교육과정 폴더 기반 통합 추천**
+1. 여러 강의 자료를 하나의 폴더에 업로드
+2. 폴더 전체 기반 종합 추천
+3. 심화 학습을 위한 추가 자료 발견
+4. 다양한 매체(책, 동영상, 영화)를 통한 입체적 학습
+
+---
+
+#### **POST /recommend/** - 키워드 직접 입력 추천 (기존 방식)
+```
+🎯 목적: 사용자가 직접 입력한 키워드로 학습 콘텐츠 추천
+📍 위치: Swagger UI > Recommend > POST /recommend/
+
+💡 사용 시나리오: 특정 키워드에 대한 추천이 필요할 때 (파일 없이)
 
 테스트 절차:
-1. 삭제할 file_id 준비
-2. "Try it out" 버튼 클릭
-3. file_id 입력 후 "Execute"
+1. "Try it out" 버튼 클릭
+2. 원하는 키워드와 설정으로 Request body 작성
 ```
+
+#### **키워드 직접 입력 테스트 예시:**
+
+**📚 1. Python 학습 자료 추천**
+```json
+{
+  "keywords": ["Python", "프로그래밍", "FastAPI"],
+  "content_types": ["book", "youtube_video", "article"],
+  "max_items": 10,
+  "include_youtube": true,
+  "youtube_max_per_keyword": 3
+}
+```
+
+**🎥 2. YouTube 중심 추천 (머신러닝)**
+```json
+{
+  "keywords": ["머신러닝", "데이터 사이언스", "딥러닝"],
+  "content_types": ["youtube_video"],
+  "max_items": 15,
+  "include_youtube": true,
+  "youtube_max_per_keyword": 5
+}
+```
+
+**📖 3. 비즈니스 도서 추천**
+```json
+{
+  "keywords": ["경영학", "마케팅", "비즈니스 전략"],
+  "content_types": ["book"],
+  "max_items": 8,
+  "include_youtube": false
+}
+```
+
+**🎬 4. 역사 영화/다큐 추천**
+```json
+{
+  "keywords": ["한국사", "조선시대", "임진왜란"],
+  "content_types": ["movie"],
+  "max_items": 5,
+  "include_youtube": false
+}
+```
+
+**🌟 5. 종합 추천 (모든 콘텐츠 타입)**
+```json
+{
+  "keywords": ["인공지능", "AI", "ChatGPT"],
+  "content_types": ["book", "movie", "video", "youtube_video", "article"],
+  "max_items": 20,
+  "include_youtube": true,
+  "youtube_max_per_keyword": 2
+}
+```
+
+#### **YouTube 특화 추천 엔드포인트들:**
+
+**🔥 POST /recommend/youtube/trending** - 인기 YouTube 동영상
+```json
+{
+  "category_id": "28",
+  "max_results": 10
+}
+```
+**카테고리 ID 참고:**
+- `"28"`: 과학&기술
+- `"27"`: 교육  
+- `"22"`: 사람&블로그
+- `"24"`: 엔터테인먼트
+- `"10"`: 음악
+
+**📋 GET /recommend/youtube/categories** - YouTube 카테고리 목록 조회
+```
+🎯 목적: 사용할 수 있는 YouTube 카테고리 확인
+📍 위치: Swagger UI > Recommend > GET /recommend/youtube/categories
+```
+
+**💾 POST /recommend/youtube/save** - 좋은 YouTube 동영상 DB 저장
+```json
+{
+  "keyword": "Python 프로그래밍 기초",
+  "video_id": "kqtD5dpn9C8"
+}
+```
+
+#### **추천 시스템 전체 워크플로우:**
+
+```
+1. 📤 파일 업로드 (POST /upload/)
+   ↓ file_id 획득
+   
+2. 🔍 자동 키워드 추출 및 추천 (POST /recommend/from-file) ⭐
+   ↓ 파일 내용 분석 → 키워드 추출 → 관련 콘텐츠 추천
+   
+3. 📚 추천 결과 활용
+   ↓ YouTube 강의, 관련 도서, 참고 영화 등
+   
+4. 💾 좋은 콘텐츠 저장 (POST /recommend/youtube/save)
+   ↓ 추후 동일 키워드 검색 시 우선 추천
+```
+
+**content_types 전체 옵션:**
+- `"book"`: 도서 추천
+- `"movie"`: 영화/다큐멘터리
+- `"video"`: 일반 동영상  
+- `"youtube_video"`: YouTube 동영상 (실시간 검색)
+- `"article"`: 온라인 아티클/블로그
 
 ## 🔄 권장 테스트 워크플로우
 
@@ -581,8 +875,8 @@ MONGODB_DB_NAME=seeq_rag
 5. 🧩 퀴즈 생성 (POST /quiz/)
    ↓ 학습용 문제 생성
    
-6. 🏷️ 키워드 추출 (POST /keywords/)
-   ↓ 주요 개념 추출
+6. 🏷️ 키워드 추출 (POST /keywords/from-file)
+   ↓ 파일에서 주요 개념 추출
    
 7. 🧠 마인드맵 (POST /mindmap/)
    ↓ 개념 연관관계
@@ -596,13 +890,15 @@ MONGODB_DB_NAME=seeq_rag
 멀티 문서 테스트:
 1. 여러 관련 문서 업로드 (같은 folder_id 사용)
 2. 폴더 단위 요약 생성
-3. 통합 마인드맵 생성
-4. 크로스 문서 질의응답
+3. 폴더 전체 키워드 추출 (POST /keywords/from-file)
+4. 통합 마인드맵 생성
+5. 크로스 문서 질의응답
 
 성능 테스트:
 1. 대용량 파일 업로드 (최대 50MB)
 2. 복잡한 질문으로 응답 시간 측정
-3. 다중 키워드 추천 테스트
+3. 대량 텍스트에서 키워드 추출 성능 테스트
+4. 다중 키워드 추천 테스트
 ```
 
 ## ⚠️ 트러블슈팅
@@ -628,7 +924,17 @@ MONGODB_DB_NAME=seeq_rag
 - 업로드된 문서가 처리 완료되었는지 확인
 ```
 
-#### 3. 데이터베이스 연결 오류
+#### 3. 키워드 추출 오류
+```
+오류: "키워드 추출 실패" 또는 422 Unprocessable Entity
+해결:
+- 파일 기반 추출: file_id 또는 folder_id가 올바른지 확인
+- 직접 텍스트 추출: text 필드가 비어있지 않은지 확인
+- 존재하는 파일 ID인지 확인 (GET /upload/list로 확인)
+- 텍스트가 너무 짧지 않은지 확인 (최소 50자 이상 권장)
+```
+
+#### 4. 데이터베이스 연결 오류
 ```
 오류: "Database objects do not implement truth value testing"
 해결:
@@ -648,15 +954,25 @@ MONGODB_DB_NAME=seeq_rag
 
 ### **고급 기능 테스트**  
 - [ ] 퀴즈 생성 정상 동작
-- [ ] 키워드 추출 성공
+- [ ] 파일 기반 키워드 추출 성공 (POST /keywords/from-file)
+- [ ] 직접 텍스트 키워드 추출 성공 (POST /keywords/)
+- [ ] 폴더 전체 키워드 추출 성공
 - [ ] 마인드맵 생성 성공
 - [ ] 콘텐츠 추천 정상 동작
 - [ ] 파일 삭제 성공
+
+### **키워드 추출 세부 테스트**
+- [ ] 특정 파일에서 키워드 추출 (use_chunks: true)
+- [ ] 특정 파일에서 키워드 추출 (use_chunks: false)
+- [ ] 폴더 전체에서 키워드 추출
+- [ ] 추출된 키워드 수가 요청한 max_keywords와 일치
+- [ ] source_info에 올바른 메타데이터 포함
 
 ### **에러 처리 테스트**
 - [ ] 잘못된 파일 형식 업로드 시 적절한 오류 메시지
 - [ ] 존재하지 않는 file_id 조회 시 404 에러
 - [ ] 빈 질문 입력 시 적절한 처리
+- [ ] 빈 text 필드로 키워드 추출 시 422 에러
 - [ ] API 한도 초과 시 오류 처리
 
 이제 `http://0.0.0.0:8000/docs`에서 위의 가이드를 따라 체계적으로 테스트해보세요! 🚀

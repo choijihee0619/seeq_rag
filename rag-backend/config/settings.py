@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     MONGODB_URI: str
     MONGODB_DB_NAME: str = "rag_database"
     
+    # YouTube API 설정
+    YOUTUBE_API_KEY: Optional[str] = None
+    
     # API 설정
     API_HOST: str = "0.0.0.0"
     API_PORT: int = 8000

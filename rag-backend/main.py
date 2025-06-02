@@ -2,6 +2,12 @@
 RAG 백엔드 메인 애플리케이션
 FastAPI 서버 초기화 및 라우터 설정
 """
+import os
+from dotenv import load_dotenv
+
+# 환경변수 로드 (최우선)
+load_dotenv()
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -20,6 +26,7 @@ async def lifespan(app: FastAPI):
     """애플리케이션 생명주기 관리"""
     # 시작 시
     logger.info("RAG 백엔드 서버 시작...")
+    logger.info(f"YouTube API 키 설정 상태: {'설정됨' if os.getenv('YOUTUBE_API_KEY') else '설정 안됨'}")
     await init_db()
     yield
     # 종료 시
