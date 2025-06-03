@@ -558,8 +558,8 @@
 6. **한국어 검색어**: 시맨틱 검색에서 한국어 검색어는 URL 인코딩이 필요합니다.
 
 ### 📊 데이터베이스 정보
-- **MONGODB_URI**: mongodb+srv://SeeQ:la5kFgpTy8xR52rr@cluster0.8lbrl0r.mongodb.net/
-- **MONGODB_DB_NAME**: rag_database
+- **MONGODB_URI**: mongodb+srv://
+- **MONGODB_DB_NAME**: 
 
 ---
 
