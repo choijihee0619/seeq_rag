@@ -70,15 +70,23 @@ class HybridSearch:
         k: int = 5
     ) -> List[Dict]:
         """키워드 기반 검색"""
-        # 텍스트 검색
-        text_filter = {"text": {"$regex": keyword, "$options": "i"}}
+        # 텍스트 검색 (새로운 구조에 맞게 수정)
+        text_filter = {"raw_text": {"$regex": keyword, "$options": "i"}}
         
         documents = []
         cursor = self.documents.find(text_filter).limit(k)
         
         async for doc in cursor:
+            file_metadata = doc.get("file_metadata", {})
             documents.append({
-                "document": doc,
+                "document": {
+                    "original_filename": file_metadata.get("original_filename", "알 수 없는 파일"),
+                    "file_type": file_metadata.get("file_type", "unknown"),
+                    "file_size": file_metadata.get("file_size", 0),
+                    "description": file_metadata.get("description"),
+                    "upload_time": doc.get("created_at"),
+                    "folder_id": doc.get("folder_id")
+                },
                 "score": 1.0  # 키워드 매칭은 동일한 점수
             })
         

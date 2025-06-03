@@ -5,13 +5,15 @@ MODIFIED 2024-01-20: YouTube API 연동 추가 - 실시간 YouTube 동영상 추
 ENHANCED 2024-01-21: 파일 기반 키워드 자동 추출 기능 추가
 CLEANED 2024-01-21: 불필요한 YouTube 개별 API 제거, 핵심 추천 기능만 유지
 REFACTORED 2024-01-21: 키워드 추출 통합 및 TextCollector 적용
+ENHANCED 2024-12-20: 추천 결과 캐싱 기능 추가 및 새 DB 구조 적용
 """
 from typing import Dict, List, Optional
 from motor.motor_asyncio import AsyncIOMotorDatabase
+from database.operations import DatabaseOperations
 from utils.logger import get_logger
 from utils.youtube_api import youtube_api
 from utils.text_collector import TextCollector
-from ai_processing.labeler import AutoLabeler
+from ai_processing.auto_labeler import AutoLabeler
 from utils.web_recommendation import web_recommendation_engine
 
 logger = get_logger(__name__)
@@ -21,9 +23,11 @@ class RecommendChain:
     
     def __init__(self, db: AsyncIOMotorDatabase):
         self.db = db
+        self.db_ops = DatabaseOperations(db)
         self.recommendations = db.recommendations
         self.documents = db.documents  # documents 컬렉션 추가
         self.chunks = db.chunks        # chunks 컬렉션 추가
+        self.file_info = db.file_info  # 새로운 file_info 컬렉션
     
     async def process(
         self,
@@ -31,7 +35,8 @@ class RecommendChain:
         content_types: List[str] = ["book", "movie", "youtube_video"],
         max_items: int = 10,
         include_youtube: bool = True,
-        youtube_max_per_keyword: int = 3
+        youtube_max_per_keyword: int = 3,
+        folder_id: Optional[str] = None
     ) -> Dict:
         """
         추천 처리
@@ -42,42 +47,83 @@ class RecommendChain:
             max_items: 최대 추천 항목 수
             include_youtube: YouTube 검색 포함 여부
             youtube_max_per_keyword: 키워드당 YouTube 결과 최대 수
+            folder_id: 폴더 ID (캐싱 및 접근 시간 업데이트용)
         """
         try:
+            # 1. 캐시 확인
+            cached_recommendations = await self.db_ops.get_recommendation_cache(
+                keywords=keywords,
+                content_types=content_types,
+                folder_id=folder_id
+            )
+            
+            if cached_recommendations:
+                logger.info("캐시된 추천 발견, 캐시 사용")
+                # 폴더 접근 시간 업데이트
+                if folder_id:
+                    await self.db_ops.update_folder_access(folder_id)
+                
+                return {
+                    "recommendations": cached_recommendations["recommendations"],
+                    "from_cache": True,
+                    "cache_created_at": cached_recommendations.get("created_at")
+                }
+            
+            # 2. 새로운 추천 생성
             recommendations = []
             
-            # 1. 기존 DB에서 저장된 추천 검색
+            # 3. 기존 DB에서 저장된 추천 검색
             db_recommendations = await self._search_db_recommendations(
                 keywords, content_types, max_items
             )
             recommendations.extend(db_recommendations)
             
-            # 2. YouTube 실시간 검색 (include_youtube가 True이고 video 관련 타입이 포함된 경우)
+            # 4. YouTube 실시간 검색 (include_youtube가 True이고 video 관련 타입이 포함된 경우)
             if include_youtube and ("video" in content_types or "youtube_video" in content_types):
                 youtube_recommendations = await self._search_youtube_recommendations(
                     keywords, youtube_max_per_keyword
                 )
                 recommendations.extend(youtube_recommendations)
             
-            # 3. 웹 검색 기반 실시간 추천 (book, movie, video 타입)
+            # 5. 웹 검색 기반 실시간 추천 (book, movie, video 타입)
             web_recommendations = await self._search_web_recommendations(
                 keywords, content_types, max_items
             )
             recommendations.extend(web_recommendations)
             
-            # 4. 결과 정렬 및 제한
+            # 6. 결과 정렬 및 제한
             # 다양성을 위해 키워드별로 균등하게 분배
             final_recommendations = self._balance_recommendations(
                 recommendations, keywords, max_items
             )
             
-            # 5. 추천이 부족한 경우에만 fallback 데이터 추가
+            # 7. 추천이 부족한 경우에만 fallback 데이터 추가
             if len(final_recommendations) < max_items:
                 fallback_recommendations = self._generate_fallback_recommendations(keywords)
                 final_recommendations.extend(fallback_recommendations)
             
+            final_result = final_recommendations[:max_items]
+            
+            # 8. 추천 결과 캐싱 (빈 결과가 아닌 경우에만)
+            if final_result:
+                try:
+                    await self.db_ops.save_recommendation_cache(
+                        recommendations=final_result,
+                        keywords=keywords,
+                        content_types=content_types,
+                        folder_id=folder_id
+                    )
+                    logger.info("추천 결과 캐시 저장 완료")
+                except Exception as cache_error:
+                    logger.warning(f"추천 캐시 저장 실패: {cache_error}")
+            
+            # 9. 폴더 접근 시간 업데이트
+            if folder_id:
+                await self.db_ops.update_folder_access(folder_id)
+            
             return {
-                "recommendations": final_recommendations[:max_items]
+                "recommendations": final_result,
+                "from_cache": False
             }
             
         except Exception as e:
@@ -200,11 +246,11 @@ class RecommendChain:
                     )
                     recommendations.extend(movies)
             
-            logger.info(f"웹 검색에서 {len(recommendations)}개 추천 생성")
+            logger.info(f"웹에서 {len(recommendations)}개 추천 검색")
             return recommendations
             
         except Exception as e:
-            logger.error(f"웹 검색 추천 실패: {e}")
+            logger.warning(f"웹 추천 검색 실패: {e}")
             return []
 
     def _balance_recommendations(
@@ -213,103 +259,77 @@ class RecommendChain:
         keywords: List[str],
         max_items: int
     ) -> List[Dict]:
-        """콘텐츠 타입별 및 키워드별로 추천을 균등하게 분배"""
+        """추천 항목들을 키워드별로 균등하게 분배"""
         try:
             if not recommendations:
                 return []
             
-            # 1. 콘텐츠 타입별로 그룹화
-            content_type_groups = {}
+            # 키워드별로 그룹화
+            keyword_groups = {}
             for rec in recommendations:
-                content_type = rec.get("content_type", "기타")
-                if content_type not in content_type_groups:
-                    content_type_groups[content_type] = []
-                content_type_groups[content_type].append(rec)
+                keyword = rec.get("keyword", "unknown")
+                if keyword not in keyword_groups:
+                    keyword_groups[keyword] = []
+                keyword_groups[keyword].append(rec)
             
-            # 2. 각 콘텐츠 타입에서 최대 허용 개수 계산
-            num_content_types = len(content_type_groups)
-            max_per_content_type = max(2, max_items // num_content_types)  # 최소 2개씩 보장
-            
+            # 균등 분배
             balanced = []
+            max_per_keyword = max(1, max_items // len(keyword_groups))
             
-            # 3. 각 콘텐츠 타입에서 균등하게 선택
-            for content_type, group in content_type_groups.items():
-                # 해당 콘텐츠 타입 내에서 키워드별로 균등분배
-                keyword_groups = {}
-                for rec in group:
-                    keyword = rec.get("keyword", "기타")
-                    if keyword not in keyword_groups:
-                        keyword_groups[keyword] = []
-                    keyword_groups[keyword].append(rec)
+            for keyword, recs in keyword_groups.items():
+                balanced.extend(recs[:max_per_keyword])
+            
+            # 소스별 다양성 확보
+            final_balanced = []
+            source_count = {}
+            
+            for rec in balanced[:max_items]:
+                source = rec.get("recommendation_source", "unknown")
+                count = source_count.get(source, 0)
                 
-                # 키워드별로 균등하게 선택
-                content_type_items = []
-                items_per_keyword = max(1, max_per_content_type // len(keyword_groups))
-                
-                for keyword, keyword_group in keyword_groups.items():
-                    selected = keyword_group[:items_per_keyword]
-                    content_type_items.extend(selected)
-                
-                # 콘텐츠 타입별 최대 개수로 제한
-                content_type_items = content_type_items[:max_per_content_type]
-                balanced.extend(content_type_items)
-                
-                logger.info(f"콘텐츠 타입 '{content_type}': {len(content_type_items)}개 선택")
+                # 같은 소스의 추천이 너무 많지 않도록 제한
+                if count < max_items // 3:  # 최대 1/3까지만
+                    final_balanced.append(rec)
+                    source_count[source] = count + 1
             
-            # 4. 남은 자리가 있으면 추가 선택 (다양성 우선)
-            remaining = max_items - len(balanced)
-            if remaining > 0:
-                remaining_items = [rec for rec in recommendations if rec not in balanced]
-                # 콘텐츠 타입별로 순서대로 추가 (다양성 보장)
-                type_rotation = list(content_type_groups.keys())
-                type_index = 0
-                
-                for item in remaining_items:
-                    if len(balanced) >= max_items:
-                        break
-                    
-                    # 현재 타입이 이미 많이 포함되었는지 확인
-                    current_type = item.get("content_type")
-                    current_type_count = sum(1 for b in balanced if b.get("content_type") == current_type)
-                    
-                    # 타입별 최대 개수를 넘지 않도록 제한
-                    if current_type_count < max_per_content_type + 1:  # +1 여유
-                        balanced.append(item)
-            
-            logger.info(f"균형 조정 완료: 총 {len(balanced)}개 (타입별 균등분배)")
-            
-            # 5. 콘텐츠 타입별 분포 로깅
-            final_distribution = {}
-            for item in balanced:
-                content_type = item.get("content_type", "기타")
-                final_distribution[content_type] = final_distribution.get(content_type, 0) + 1
-            
-            logger.info(f"최종 콘텐츠 타입 분포: {final_distribution}")
-            
-            return balanced[:max_items]
+            return final_balanced
             
         except Exception as e:
-            logger.error(f"추천 균등 분배 실패: {e}")
+            logger.warning(f"추천 균형화 실패: {e}")
             return recommendations[:max_items]
 
     def _generate_fallback_recommendations(self, keywords: List[str]) -> List[Dict]:
-        """폴백 추천 생성 (검색 결과가 없을 때)"""
-        fallback_recommendations = []
-        
-        for keyword in keywords[:5]:  # 최대 5개 키워드만
-            fallback_recommendations.extend([
-                {
-                    "title": f"{keyword} 관련 도서 추천",
-                    "content_type": "book",
-                    "description": f"{keyword}에 대해 더 자세히 알 수 있는 도서를 찾아보세요.",
-                    "source": "추천 시스템",
-                    "metadata": {},
-                    "keyword": keyword,
-                    "recommendation_source": "fallback"
-                }
-            ])
-        
-        return fallback_recommendations
+        """기본 추천 생성 (검색 결과가 부족할 때)"""
+        try:
+            fallback_items = []
+            
+            for i, keyword in enumerate(keywords[:3]):
+                fallback_items.extend([
+                    {
+                        "title": f"{keyword} 관련 추천 도서",
+                        "content_type": "book",
+                        "description": f"{keyword}에 대해 더 알아볼 수 있는 도서를 찾아보세요.",
+                        "source": "fallback",
+                        "metadata": {"type": "fallback"},
+                        "keyword": keyword,
+                        "recommendation_source": "fallback"
+                    },
+                    {
+                        "title": f"{keyword} 관련 영상",
+                        "content_type": "youtube_video",
+                        "description": f"{keyword}에 대한 유용한 영상을 검색해보세요.",
+                        "source": "fallback",
+                        "metadata": {"type": "fallback"},
+                        "keyword": keyword,
+                        "recommendation_source": "fallback"
+                    }
+                ])
+            
+            return fallback_items
+            
+        except Exception as e:
+            logger.warning(f"기본 추천 생성 실패: {e}")
+            return []
 
     async def extract_keywords_from_file(
         self,
@@ -317,48 +337,86 @@ class RecommendChain:
         folder_id: Optional[str] = None,
         max_keywords: int = 5
     ) -> List[str]:
-        """
-        업로드된 파일이나 폴더에서 키워드를 자동 추출
-        
-        Args:
-            file_id: 특정 파일 ID
-            folder_id: 폴더 ID (해당 폴더의 모든 파일에서 키워드 추출)
-            max_keywords: 추출할 최대 키워드 수
-            
-        Returns:
-            추출된 키워드 리스트
-        """
+        """파일에서 키워드 자동 추출"""
         try:
-            # TextCollector를 사용하여 텍스트 수집
-            combined_text = ""
             if file_id:
-                combined_text = await TextCollector.get_text_from_file(
+                # 특정 파일에서 텍스트 추출 (새로운 구조 적용)
+                # file_info 대신 TextCollector 사용
+                collected_text = await TextCollector.get_text_from_file(
                     self.db, file_id, use_chunks=True
                 )
+                
+                if not collected_text.strip():
+                    logger.warning(f"파일에서 텍스트를 추출할 수 없음: {file_id}")
+                    return []
+                    
             elif folder_id:
-                combined_text = await TextCollector.get_text_from_folder(
+                # 폴더에서 텍스트 수집 (새로운 documents 컬렉션 사용)
+                collected_text = await TextCollector.get_text_from_folder(
                     self.db, folder_id, use_chunks=True
                 )
+                
+                if not collected_text.strip():
+                    logger.warning(f"폴더에서 텍스트를 추출할 수 없음: {folder_id}")
+                    return []
+            else:
+                raise ValueError("file_id 또는 folder_id가 필요합니다")
             
-            if not combined_text.strip():
-                logger.warning(f"텍스트를 찾을 수 없음: file_id={file_id}, folder_id={folder_id}")
+            if not collected_text:
+                logger.warning("추출할 텍스트가 없습니다")
                 return []
             
-            # 텍스트가 너무 긴 경우 제한
-            if len(combined_text) > 5000:
-                combined_text = combined_text[:5000] + "..."
-                logger.info("텍스트가 너무 길어 5000자로 제한했습니다.")
+            # 자동 라벨링을 통한 키워드 추출
+            auto_labeler = AutoLabeler()
+            labels = await auto_labeler.analyze_document(collected_text)
             
-            # AutoLabeler를 사용하여 키워드 추출
-            labeler = AutoLabeler()
-            keywords = await labeler.extract_keywords(
-                text=combined_text,
-                max_keywords=max_keywords
-            )
+            # 키워드와 태그 결합
+            keywords = labels.get("keywords", []) + labels.get("tags", [])
             
-            logger.info(f"키워드 추출 완료: {len(keywords)}개 - {keywords}")
-            return keywords
+            # 중복 제거 및 길이 제한
+            unique_keywords = list(set(keywords))[:max_keywords]
+            
+            logger.info(f"추출된 키워드: {unique_keywords}")
+            return unique_keywords
             
         except Exception as e:
             logger.error(f"키워드 추출 실패: {e}")
             return []
+    
+    async def get_cached_recommendations(self, folder_id: Optional[str] = None, limit: int = 10) -> List[Dict]:
+        """캐시된 추천 목록 조회"""
+        try:
+            filter_dict = {}
+            if folder_id:
+                filter_dict["folder_id"] = folder_id
+            
+            cached_recs = await self.db_ops.find_many(
+                "recommendations", 
+                filter_dict, 
+                limit=limit
+            )
+            
+            return [
+                {
+                    "cache_id": str(rec["_id"]),
+                    "keywords": rec.get("keywords", []),
+                    "content_types": rec.get("content_types", []),
+                    "recommendation_count": len(rec.get("recommendations", [])),
+                    "created_at": rec["created_at"],
+                    "last_accessed_at": rec["last_accessed_at"]
+                }
+                for rec in cached_recs
+            ]
+            
+        except Exception as e:
+            logger.error(f"캐시된 추천 목록 조회 실패: {e}")
+            return []
+    
+    async def delete_recommendation_cache(self, cache_id: str) -> bool:
+        """추천 캐시 삭제"""
+        try:
+            from bson import ObjectId
+            return await self.db_ops.delete_one("recommendations", {"_id": ObjectId(cache_id)})
+        except Exception as e:
+            logger.error(f"추천 캐시 삭제 실패: {e}")
+            return False

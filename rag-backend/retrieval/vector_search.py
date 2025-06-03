@@ -50,13 +50,13 @@ class VectorSearch:
             match_stage = {}
             if filter_dict:
                 if "folder_id" in filter_dict:
-                    # folder_id로 필터링하는 경우 documents 컬렉션과 조인 필요
+                    # folder_id로 필터링하는 경우 documents 컬렉션과 조인 필요 (새로운 구조에 맞게 수정)
                     pipeline.extend([
                         {
                             "$lookup": {
                                 "from": "documents",
                                 "localField": "file_id",
-                                "foreignField": "file_id",
+                                "foreignField": "file_metadata.file_id",
                                 "as": "document_info"
                             }
                         },
@@ -109,14 +109,34 @@ class VectorSearch:
             for item in top_chunks:
                 chunk = item["chunk"]
                 
-                # 문서 정보 조회
+                # 문서 정보 조회 (새로운 구조에 맞게 수정)
                 document = await self.documents_collection.find_one(
-                    {"file_id": chunk["file_id"]}
+                    {"file_metadata.file_id": chunk["file_id"]}
                 )
+                
+                # document가 없으면 기본값 설정
+                if not document:
+                    document = {
+                        "file_metadata": {
+                            "original_filename": "알 수 없는 파일",
+                            "file_type": "unknown",
+                            "file_size": 0
+                        }
+                    }
+                
+                # 새로운 구조에 맞게 document 정보 정리
+                document_info = document.get("file_metadata", {}) if document else {}
                 
                 results.append({
                     "chunk": chunk,
-                    "document": document,
+                    "document": {
+                        "original_filename": document_info.get("original_filename", "알 수 없는 파일"),
+                        "file_type": document_info.get("file_type", "unknown"),
+                        "file_size": document_info.get("file_size", 0),
+                        "description": document_info.get("description"),
+                        "upload_time": document.get("created_at") if document else None,
+                        "folder_id": document.get("folder_id") if document else None
+                    },
                     "score": item["score"],
                     "chunk_id": chunk.get("chunk_id"),
                     "sequence": chunk.get("sequence", 0)

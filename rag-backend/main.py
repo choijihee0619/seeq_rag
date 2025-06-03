@@ -15,7 +15,7 @@ import uvicorn
 
 from config.settings import settings
 from database.connection import init_db, close_db
-from api.routers import query, summary, quiz, keywords, mindmap, recommend, upload
+from api.routers import query, summary, quiz, keywords, mindmap, recommend, upload, folders
 from utils.logger import setup_logger
 
 # 로거 설정
@@ -51,6 +51,7 @@ app.add_middleware(
 )
 
 # 라우터 등록
+app.include_router(folders.router, prefix="/folders", tags=["Folders"])
 app.include_router(upload.router, prefix="/upload", tags=["Upload"])
 app.include_router(query.router, prefix="/query", tags=["Query"])
 app.include_router(summary.router, prefix="/summary", tags=["Summary"])

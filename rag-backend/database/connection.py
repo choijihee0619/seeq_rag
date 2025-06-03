@@ -1,6 +1,7 @@
 """
 데이터베이스 연결 모듈
 MongoDB 연결 관리
+MODIFIED 2024-12-20: 새로운 컬렉션 구조에 맞게 인덱스 재설계
 """
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 from config.settings import settings
@@ -41,30 +42,97 @@ class DatabaseConnection:
     async def create_indexes(self):
         """필요한 인덱스 생성"""
         try:
-            # documents 컬렉션 인덱스
-            await self.db.documents.create_index("folder_id")
-            await self.db.documents.create_index("chunk_id")
-            await self.db.documents.create_index([("text", "text")])
+            # folders 컬렉션 인덱스
+            await self.db.folders.create_index("folder_type")
+            await self.db.folders.create_index("title")
+            await self.db.folders.create_index("created_at")
+            await self.db.folders.create_index("last_accessed_at")
             
-            # labels 컬렉션 인덱스
-            await self.db.labels.create_index("document_id")
+            # documents 컬렉션 인덱스 (새로운 구조)
+            await self.db.documents.create_index("folder_id")
+            await self.db.documents.create_index("chunk_sequence")
+            await self._create_text_index("documents", "raw_text")
+            await self.db.documents.create_index("created_at")
+            
+            # chunks 컬렉션 인덱스 (기존 유지하되 개선)
+            await self.db.chunks.create_index("folder_id")
+            await self.db.chunks.create_index("document_id")
+            await self.db.chunks.create_index("file_id")
+            await self.db.chunks.create_index("sequence")
+            await self._create_text_index("chunks", "text")
+            
+            # summaries 컬렉션 인덱스 (새로 추가)
+            await self.db.summaries.create_index("folder_id")
+            await self.db.summaries.create_index("document_ids")
+            await self.db.summaries.create_index("summary_type")
+            await self.db.summaries.create_index("created_at")
+            await self.db.summaries.create_index("cache_key", unique=True)
+            
+            # qapairs 컬렉션 인덱스 (개선)
+            await self.db.qapairs.create_index("folder_id")
+            await self.db.qapairs.create_index("source_document_id")
+            await self.db.qapairs.create_index("difficulty")
+            await self.db.qapairs.create_index("quiz_type")
+            await self.db.qapairs.create_index("topic")
+            await self.db.qapairs.create_index("created_at")
+            
+            # recommendations 컬렉션 인덱스 (새로 추가)
+            await self.db.recommendations.create_index("folder_id")
+            await self.db.recommendations.create_index("keywords")
+            await self.db.recommendations.create_index("content_types")
+            await self.db.recommendations.create_index("created_at")
+            await self.db.recommendations.create_index("cache_key", unique=True)
+            
+            # labels 컬렉션 인덱스 (자동 라벨링용)
             await self.db.labels.create_index("folder_id")
+            await self.db.labels.create_index("document_id")
             await self.db.labels.create_index("tags")
             await self.db.labels.create_index("category")
-            
-            # qapairs 컬렉션 인덱스
-            await self.db.qapairs.create_index("document_id")
-            await self.db.qapairs.create_index("folder_id")
-            await self.db.qapairs.create_index("difficulty")
-            
-            # recommendations 컬렉션 인덱스
-            await self.db.recommendations.create_index("keyword")
-            await self.db.recommendations.create_index("content_type")
+            await self.db.labels.create_index("confidence_score")
+            await self.db.labels.create_index("created_at")
             
             logger.info("인덱스 생성 완료")
             
         except Exception as e:
             logger.error(f"인덱스 생성 실패: {e}")
+    
+    async def _create_text_index(self, collection_name: str, field_name: str):
+        """텍스트 인덱스 안전 생성"""
+        try:
+            collection = self.db[collection_name]
+            
+            # 기존 텍스트 인덱스 확인
+            indexes = await collection.list_indexes().to_list(None)
+            text_indexes = [idx for idx in indexes if idx.get('key', {}).get('_fts') == 'text']
+            
+            # 원하는 필드의 텍스트 인덱스가 이미 있는지 확인
+            desired_index_exists = False
+            for idx in text_indexes:
+                weights = idx.get('weights', {})
+                if field_name in weights and len(weights) == 1:
+                    desired_index_exists = True
+                    break
+            
+            if desired_index_exists:
+                logger.info(f"{collection_name}.{field_name} 텍스트 인덱스가 이미 존재함")
+                return
+            
+            # 다른 필드의 텍스트 인덱스가 있으면 삭제
+            for idx in text_indexes:
+                weights = idx.get('weights', {})
+                if field_name not in weights or len(weights) > 1:
+                    index_name = idx.get('name', '')
+                    if index_name:
+                        logger.info(f"기존 텍스트 인덱스 삭제: {collection_name}.{index_name}")
+                        await collection.drop_index(index_name)
+            
+            # 새 텍스트 인덱스 생성
+            await collection.create_index([(field_name, "text")])
+            logger.info(f"{collection_name}.{field_name} 텍스트 인덱스 생성 완료")
+            
+        except Exception as e:
+            logger.warning(f"{collection_name}.{field_name} 텍스트 인덱스 생성 실패: {e}")
+            # 텍스트 인덱스 실패는 치명적이지 않으므로 경고만 출력
 
 # 싱글톤 인스턴스
 db_connection = DatabaseConnection()

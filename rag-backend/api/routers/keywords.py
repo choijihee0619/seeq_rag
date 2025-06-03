@@ -5,7 +5,7 @@ MODIFIED 2024-01-21: TextCollector 유틸리티 적용하여 중복 코드 제�
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
-from ai_processing.labeler import AutoLabeler
+from ai_processing.auto_labeler import AutoLabeler
 from database.connection import get_database
 from utils.logger import get_logger
 from utils.text_collector import TextCollector

@@ -5,6 +5,7 @@ FIXED 2024-01-20: YouTube 동영상 저장 API 수정
 ENHANCED 2024-01-21: 업로드된 파일 기반 자동 추천 기능 추가
 CLEANED 2024-01-21: 불필요한 YouTube 개별 API 제거, 핵심 기능만 유지
 OPTIMIZED 2024-01-21: 디버그 엔드포인트 제거, 프로덕션 준비 완료
+ENHANCED 2024-12-20: 캐시 관리 및 folder_id 지원 추가
 """
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -23,6 +24,7 @@ class RecommendRequest(BaseModel):
     max_items: int = 10
     include_youtube: bool = True  # YouTube 검색 포함 여부
     youtube_max_per_keyword: int = 3  # 키워드당 YouTube 결과 수
+    folder_id: Optional[str] = None  # 폴더 ID 추가
 
 class FileBasedRecommendRequest(BaseModel):
     """파일 기반 추천 요청 모델"""
@@ -51,6 +53,21 @@ class RecommendResponse(BaseModel):
     youtube_included: bool  # YouTube 결과 포함 여부
     sources_summary: Dict  # 소스별 개수 요약
     extracted_keywords: Optional[List[str]] = None  # 자동 추출된 키워드 (파일 기반 추천에서만)
+    from_cache: Optional[bool] = False  # 캐시 사용 여부 추가
+
+class CachedRecommendationItem(BaseModel):
+    """캐시된 추천 항목 모델"""
+    cache_id: str
+    keywords: List[str]
+    content_types: List[str]
+    recommendation_count: int
+    created_at: str
+    last_accessed_at: str
+
+class CachedRecommendationsResponse(BaseModel):
+    """캐시된 추천 목록 응답 모델"""
+    cached_recommendations: List[CachedRecommendationItem]
+    total_count: int
 
 @router.post("/", response_model=RecommendResponse)
 async def get_recommendations(request: RecommendRequest):
@@ -65,7 +82,8 @@ async def get_recommendations(request: RecommendRequest):
             content_types=request.content_types,
             max_items=request.max_items,
             include_youtube=request.include_youtube,
-            youtube_max_per_keyword=request.youtube_max_per_keyword
+            youtube_max_per_keyword=request.youtube_max_per_keyword,
+            folder_id=request.folder_id  # 폴더 ID 추가
         )
         
         # 추천 항목 변환
@@ -96,7 +114,8 @@ async def get_recommendations(request: RecommendRequest):
             recommendations=recommendations,
             total_count=len(recommendations),
             youtube_included=youtube_count > 0,
-            sources_summary=sources_count
+            sources_summary=sources_count,
+            from_cache=result.get("from_cache", False)  # 캐시 사용 여부 추가
         )
         
     except Exception as e:
@@ -138,7 +157,8 @@ async def get_file_based_recommendations(request: FileBasedRecommendRequest):
             content_types=request.content_types,
             max_items=request.max_items,
             include_youtube=request.include_youtube,
-            youtube_max_per_keyword=request.youtube_max_per_keyword
+            youtube_max_per_keyword=request.youtube_max_per_keyword,
+            folder_id=request.folder_id  # 폴더 ID 전달
         )
         
         # 3. 추천 항목 변환
@@ -170,11 +190,60 @@ async def get_file_based_recommendations(request: FileBasedRecommendRequest):
             total_count=len(recommendations),
             youtube_included=youtube_count > 0,
             sources_summary=sources_count,
-            extracted_keywords=extracted_keywords  # 추출된 키워드도 함께 반환
+            extracted_keywords=extracted_keywords,  # 추출된 키워드도 함께 반환
+            from_cache=result.get("from_cache", False)  # 캐시 사용 여부 추가
         )
         
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"파일 기반 추천 생성 실패: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/cached", response_model=CachedRecommendationsResponse)
+async def get_cached_recommendations(folder_id: Optional[str] = None, limit: int = 10):
+    """캐시된 추천 목록 조회 엔드포인트"""
+    try:
+        db = await get_database()
+        recommend_chain = RecommendChain(db)
+        
+        cached_recs = await recommend_chain.get_cached_recommendations(folder_id, limit)
+        
+        return CachedRecommendationsResponse(
+            cached_recommendations=[
+                CachedRecommendationItem(
+                    cache_id=item["cache_id"],
+                    keywords=item["keywords"],
+                    content_types=item["content_types"],
+                    recommendation_count=item["recommendation_count"],
+                    created_at=str(item["created_at"]),
+                    last_accessed_at=str(item["last_accessed_at"])
+                )
+                for item in cached_recs
+            ],
+            total_count=len(cached_recs)
+        )
+        
+    except Exception as e:
+        logger.error(f"캐시된 추천 목록 조회 실패: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.delete("/cached/{cache_id}")
+async def delete_recommendation_cache(cache_id: str):
+    """추천 캐시 삭제 엔드포인트"""
+    try:
+        db = await get_database()
+        recommend_chain = RecommendChain(db)
+        
+        success = await recommend_chain.delete_recommendation_cache(cache_id)
+        
+        if success:
+            return {"success": True, "message": "추천 캐시가 삭제되었습니다."}
+        else:
+            raise HTTPException(status_code=404, detail="추천 캐시를 찾을 수 없습니다.")
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"추천 캐시 삭제 실패: {e}")
         raise HTTPException(status_code=500, detail=str(e))

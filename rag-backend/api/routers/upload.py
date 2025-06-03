@@ -80,6 +80,7 @@ class FileUpdateRequest(BaseModel):
     filename: Optional[str] = None
     description: Optional[str] = None
     folder_id: Optional[str] = None
+    folder_title: Optional[str] = None
 
 class FilePreviewResponse(BaseModel):
     """파일 미리보기 응답 모델"""
@@ -96,12 +97,21 @@ class FilePreviewResponse(BaseModel):
 async def upload_file(
     file: UploadFile = File(...),
     folder_id: Optional[str] = Form(None),
+    folder_title: Optional[str] = Form(None),
     description: Optional[str] = Form(None)
 ):
     """파일 업로드 및 처리"""
     try:
         # 디버깅: 받은 폼 데이터 로그 출력
-        logger.info(f"업로드 폼 데이터 - 파일명: {file.filename}, folder_id: '{folder_id}', description: '{description}'")
+        logger.info(f"업로드 폼 데이터 - 파일명: {file.filename}, folder_id: '{folder_id}', folder_title: '{folder_title}', description: '{description}'")
+        
+        # folder_id와 folder_title 동시 입력 방지
+        if (folder_id and folder_id.strip() and folder_id not in ["string", "null"]) and \
+           (folder_title and folder_title.strip() and folder_title not in ["string", "null"]):
+            raise HTTPException(
+                status_code=400, 
+                detail="folder_id와 folder_title은 동시에 입력할 수 없습니다. 둘 중 하나만 선택해주세요."
+            )
         
         # 파일 정보 검증
         if not file.filename:
@@ -140,17 +150,52 @@ async def upload_file(
         with open(temp_file_path, "wb") as temp_file:
             temp_file.write(file_content)
         
-        # Form 데이터 정리 - 빈 값이나 기본값 처리
+        # Form 데이터 정리 및 폴더 ID 결정
         clean_folder_id = None
         clean_description = None
         
+        # 1. folder_id 직접 입력 처리
         if folder_id and folder_id.strip() and folder_id not in ["string", "null"]:
             clean_folder_id = folder_id.strip()
+            logger.info(f"folder_id로 폴더 지정: {clean_folder_id}")
+            
+            # folder_id 유효성 검증
+            from bson import ObjectId
+            try:
+                if not ObjectId.is_valid(clean_folder_id):
+                    raise HTTPException(status_code=400, detail="유효하지 않은 folder_id 형식입니다.")
+                
+                # 폴더 존재 확인
+                folder_exists = await db.folders.find_one({"_id": ObjectId(clean_folder_id)})
+                if not folder_exists:
+                    raise HTTPException(status_code=404, detail=f"folder_id '{clean_folder_id}'에 해당하는 폴더를 찾을 수 없습니다.")
+                    
+            except Exception as e:
+                if isinstance(e, HTTPException):
+                    raise
+                raise HTTPException(status_code=400, detail=f"folder_id 검증 실패: {str(e)}")
         
+        # 2. folder_title로 폴더 검색 처리
+        elif folder_title and folder_title.strip() and folder_title not in ["string", "null"]:
+            clean_folder_title = folder_title.strip()
+            logger.info(f"folder_title로 폴더 검색: {clean_folder_title}")
+            
+            # 폴더 title로 검색
+            folder_by_title = await db.folders.find_one({"title": clean_folder_title})
+            if not folder_by_title:
+                raise HTTPException(
+                    status_code=404, 
+                    detail=f"'{clean_folder_title}' 제목의 폴더를 찾을 수 없습니다. 먼저 폴더를 생성해주세요."
+                )
+            
+            clean_folder_id = str(folder_by_title["_id"])
+            logger.info(f"폴더 title '{clean_folder_title}' -> folder_id: {clean_folder_id}")
+        
+        # 3. description 처리
         if description and description.strip() and description not in ["string", "null"]:
             clean_description = description.strip()
         
-        logger.info(f"정리된 데이터 - clean_folder_id: '{clean_folder_id}', clean_description: '{clean_description}'")
+        logger.info(f"최종 정리된 데이터 - clean_folder_id: '{clean_folder_id}', clean_description: '{clean_description}'")
         
         # 파일 메타데이터 준비
         file_metadata = {
@@ -176,11 +221,22 @@ async def upload_file(
         except Exception as e:
             logger.warning(f"임시 파일 삭제 실패: {e}")
         
-        logger.info(f"파일 업로드 완료: {file.filename} -> {file_id}")
+        # 성공 메시지 생성
+        success_message = "파일 업로드가 완료되었습니다."
+        if clean_folder_id:
+            # 폴더 정보 조회해서 메시지에 포함
+            try:
+                folder_info = await db.folders.find_one({"_id": ObjectId(clean_folder_id)})
+                if folder_info:
+                    success_message += f" (폴더: {folder_info['title']})"
+            except:
+                pass
+        
+        logger.info(f"파일 업로드 완료: {file.filename} -> {file_id} (폴더: {clean_folder_id})")
         
         return UploadResponse(
             success=True,
-            message="파일 업로드가 완료되었습니다.",
+            message=success_message,
             file_id=file_id,
             original_filename=file.filename,
             processed_chunks=result["chunks_count"],
@@ -199,25 +255,64 @@ async def get_file_status(file_id: str):
     try:
         db = await get_database()
         
-        # documents 컬렉션에서 파일 정보 조회
-        document = await db.documents.find_one({"file_id": file_id})
+        # 1. file_info 컬렉션에서 파일 정보 조회 (처리 상태 포함)
+        file_info = await db.file_info.find_one({"file_id": file_id})
         
-        if not document:
-            raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다.")
+        if file_info:
+            # file_info에 기록이 있으면 해당 상태 반환
+            chunks_count = await db.chunks.count_documents({"file_id": file_id})
+            
+            return FileStatus(
+                file_id=file_id,
+                original_filename=file_info["original_filename"],
+                file_type=file_info["file_type"],
+                file_size=file_info["file_size"],
+                status=file_info["processing_status"],  # "processing", "completed", "failed"
+                processed_chunks=chunks_count,
+                upload_time=file_info["upload_time"],
+                folder_id=file_info.get("folder_id")
+            )
         
-        # chunks 컬렉션에서 청크 개수 조회
-        chunks_count = await db.chunks.count_documents({"file_id": file_id})
+        # 2. documents 컬렉션에서 파일 정보 조회 (새로운 구조)
+        document = await db.documents.find_one({"file_metadata.file_id": file_id})
         
-        return FileStatus(
-            file_id=file_id,
-            original_filename=document["original_filename"],
-            file_type=document["file_type"],
-            file_size=document["file_size"],
-            status="completed",  # 현재는 단순화
-            processed_chunks=chunks_count,
-            upload_time=document["upload_time"],
-            folder_id=document.get("folder_id")
-        )
+        if document:
+            # documents에 있으면 성공적으로 처리된 것
+            chunks_count = await db.chunks.count_documents({"file_id": file_id})
+            file_metadata = document["file_metadata"]
+            
+            return FileStatus(
+                file_id=file_id,
+                original_filename=file_metadata["original_filename"],
+                file_type=file_metadata["file_type"],
+                file_size=file_metadata["file_size"],
+                status="completed",  # documents에 있으면 처리 완료
+                processed_chunks=chunks_count,
+                upload_time=document["created_at"],
+                folder_id=document.get("folder_id")
+            )
+        
+        # 3. chunks 컬렉션에서 직접 조회 (레거시 호환성)
+        chunk = await db.chunks.find_one({"file_id": file_id})
+        
+        if chunk:
+            # chunks에만 있는 경우 (레거시 데이터)
+            chunks_count = await db.chunks.count_documents({"file_id": file_id})
+            metadata = chunk.get("metadata", {})
+            
+            return FileStatus(
+                file_id=file_id,
+                original_filename=metadata.get("source", "알 수 없는 파일"),
+                file_type=metadata.get("file_type", "unknown"),
+                file_size=0,  # chunks에서는 파일 크기 정보가 없음
+                status="completed",  # chunks에 있으면 처리 완료로 간주
+                processed_chunks=chunks_count,
+                upload_time=chunk.get("created_at", datetime.utcnow()),
+                folder_id=chunk.get("folder_id")
+            )
+        
+        # 4. 어디에도 없으면 404 에러
+        raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다.")
         
     except HTTPException:
         raise
@@ -242,104 +337,84 @@ async def search_files(request: FileSearchRequest):
         # 2. 파일명 검색 (filename 또는 both)
         if request.search_type in ["filename", "both"]:
             filename_filter = base_filter.copy()
-            filename_filter["original_filename"] = {"$regex": request.query, "$options": "i"}
+            # 새로운 구조: file_metadata.original_filename에서 검색
+            filename_filter["file_metadata.original_filename"] = {"$regex": request.query, "$options": "i"}
             
             filename_docs = await db.documents.find(filename_filter).to_list(None)
             
             for doc in filename_docs:
-                chunks_count = await db.chunks.count_documents({"file_id": doc["file_id"]})
+                file_metadata = doc.get("file_metadata", {})
+                file_id = file_metadata.get("file_id")
+                
+                if not file_id:
+                    continue
+                    
+                chunks_count = doc.get("chunks_count", 0)  # 저장된 통계 사용
                 
                 found_files.append({
-                    "file_id": doc["file_id"],
-                    "original_filename": doc["original_filename"],
-                    "file_type": doc["file_type"],
-                    "file_size": doc["file_size"],
+                    "file_id": file_id,
+                    "original_filename": file_metadata.get("original_filename", "알 수 없는 파일"),
+                    "file_type": file_metadata.get("file_type", "unknown"),
+                    "file_size": file_metadata.get("file_size", 0),
                     "processed_chunks": chunks_count,
-                    "upload_time": doc["upload_time"],
+                    "upload_time": doc.get("created_at", datetime.utcnow()),
                     "folder_id": doc.get("folder_id"),
-                    "description": doc.get("description"),
+                    "description": file_metadata.get("description"),
                     "match_type": "filename",
                     "relevance_score": 1.0,  # 파일명 매치는 높은 점수
-                    "matched_content": f"파일명 매치: {doc['original_filename']}"
+                    "matched_content": f"파일명 매치: {file_metadata.get('original_filename')}"
                 })
         
-        # 3. 내용 검색 (content 또는 both)
+        # 3. 내용 검색 (content 또는 both) - 새로운 구조에 맞게 수정
         if request.search_type in ["content", "both"]:
-            # folder_id 필터링을 위해 documents와 조인
-            pipeline = [
-                {
-                    "$lookup": {
-                        "from": "documents",
-                        "localField": "file_id",
-                        "foreignField": "file_id",
-                        "as": "document_info"
-                    }
-                },
-                {"$unwind": "$document_info"}
-            ]
+            content_filter = base_filter.copy()
+            content_filter["raw_text"] = {"$regex": request.query, "$options": "i"}
             
-            # folder_id 필터 추가 (실제 값일 때만)
-            if request.folder_id and request.folder_id.strip() and request.folder_id != "string":
-                pipeline.append({
-                    "$match": {"document_info.folder_id": request.folder_id}
-                })
+            content_docs = await db.documents.find(content_filter).to_list(None)
             
-            # 텍스트 검색 추가
-            pipeline.extend([
-                {"$match": {"text": {"$regex": request.query, "$options": "i"}}},
-                {"$limit": request.limit * 2}  # 더 많이 찾아서 나중에 파일별로 그룹화
-            ])
-            
-            content_chunks = await db.chunks.aggregate(pipeline).to_list(None)
-            
-            # 파일별로 그룹화하고 최고 매칭 청크만 남기기
-            file_matches = {}
-            for chunk in content_chunks:
-                file_id = chunk["file_id"]
-                doc_info = chunk["document_info"]
+            for doc in content_docs:
+                file_metadata = doc.get("file_metadata", {})
+                file_id = file_metadata.get("file_id")
                 
-                if file_id not in file_matches:
-                    chunks_count = await db.chunks.count_documents({"file_id": file_id})
-                    
-                    # 매칭된 텍스트 추출 (간단한 하이라이트)
-                    text = chunk["text"]
-                    query_lower = request.query.lower()
-                    text_lower = text.lower()
-                    
-                    # 검색어 주변 텍스트 추출
-                    match_index = text_lower.find(query_lower)
-                    if match_index != -1:
-                        start = max(0, match_index - 50)
-                        end = min(len(text), match_index + len(request.query) + 50)
-                        matched_content = "..." + text[start:end] + "..."
-                    else:
-                        matched_content = text[:100] + "..."
-                    
-                    file_matches[file_id] = {
-                        "file_id": file_id,
-                        "original_filename": doc_info["original_filename"],
-                        "file_type": doc_info["file_type"],
-                        "file_size": doc_info["file_size"],
-                        "processed_chunks": chunks_count,
-                        "upload_time": doc_info["upload_time"],
-                        "folder_id": doc_info.get("folder_id"),
-                        "description": doc_info.get("description"),
-                        "match_type": "content",
-                        "relevance_score": 0.8,  # 내용 매치는 중간 점수
-                        "matched_content": matched_content
-                    }
-            
-            found_files.extend(file_matches.values())
+                if not file_id:
+                    continue
+                
+                # 이미 파일명으로 찾은 경우 스킵 (중복 방지)
+                if any(f["file_id"] == file_id for f in found_files):
+                    continue
+                
+                chunks_count = doc.get("chunks_count", 0)
+                raw_text = doc.get("raw_text", "")
+                
+                # 매칭된 텍스트 추출 (간단한 하이라이트)
+                query_lower = request.query.lower()
+                text_lower = raw_text.lower()
+                
+                # 검색어 주변 텍스트 추출
+                match_index = text_lower.find(query_lower)
+                if match_index != -1:
+                    start = max(0, match_index - 50)
+                    end = min(len(raw_text), match_index + len(request.query) + 50)
+                    matched_content = "..." + raw_text[start:end] + "..."
+                else:
+                    matched_content = raw_text[:100] + "..."
+                
+                found_files.append({
+                    "file_id": file_id,
+                    "original_filename": file_metadata.get("original_filename", "알 수 없는 파일"),
+                    "file_type": file_metadata.get("file_type", "unknown"),
+                    "file_size": file_metadata.get("file_size", 0),
+                    "processed_chunks": chunks_count,
+                    "upload_time": doc.get("created_at", datetime.utcnow()),
+                    "folder_id": doc.get("folder_id"),
+                    "description": file_metadata.get("description"),
+                    "match_type": "content",
+                    "relevance_score": 0.8,  # 내용 매치는 중간 점수
+                    "matched_content": matched_content
+                })
         
-        # 4. 중복 제거 및 정렬 (file_id 기준)
-        unique_files = {}
-        for file_data in found_files:
-            file_id = file_data["file_id"]
-            if file_id not in unique_files or file_data["relevance_score"] > unique_files[file_id]["relevance_score"]:
-                unique_files[file_id] = file_data
-        
-        # 관련성 점수 순으로 정렬
-        sorted_files = sorted(unique_files.values(), key=lambda x: x["relevance_score"], reverse=True)
+        # 4. 관련성 점수 순으로 정렬
+        sorted_files = sorted(found_files, key=lambda x: x["relevance_score"], reverse=True)
         total_found = len(sorted_files)
         
         # 페이지네이션 적용
@@ -369,34 +444,89 @@ async def search_files(request: FileSearchRequest):
 
 @router.delete("/{file_id}")
 async def delete_file(file_id: str):
-    """업로드된 파일 및 관련 데이터 삭제"""
+    """파일 완전 삭제 - 모든 구조를 지원하는 통합 삭제"""
     try:
         db = await get_database()
         
-        # 문서 정보 확인
-        document = await db.documents.find_one({"file_id": file_id})
-        if not document:
-            raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다.")
+        deleted_items = {
+            "documents": 0,
+            "chunks": 0,
+            "file_info": 0,
+            "labels": 0
+        }
         
-        # 관련 청크들 삭제
+        logger.info(f"파일 삭제 시작: {file_id}")
+        
+        # 1. documents 컬렉션에서 삭제 (새 구조 + 기존 구조 모두 지원)
+        # 새로운 구조 (file_metadata.file_id)
+        doc_result_new = await db.documents.delete_many({"file_metadata.file_id": file_id})
+        deleted_items["documents"] += doc_result_new.deleted_count
+        
+        # 기존 구조 (file_id 직접)
+        doc_result_old = await db.documents.delete_many({"file_id": file_id})
+        deleted_items["documents"] += doc_result_old.deleted_count
+        
+        # 2. chunks 컬렉션에서 삭제
         chunks_result = await db.chunks.delete_many({"file_id": file_id})
+        deleted_items["chunks"] = chunks_result.deleted_count
         
-        # 문서 정보 삭제
-        doc_result = await db.documents.delete_one({"file_id": file_id})
+        # 3. file_info 컬렉션에서 삭제
+        file_info_result = await db.file_info.delete_many({"file_id": file_id})
+        deleted_items["file_info"] = file_info_result.deleted_count
         
-        logger.info(f"파일 삭제 완료: {file_id}, 청크 {chunks_result.deleted_count}개, 문서 {doc_result.deleted_count}개")
+        # 4. labels 컬렉션에서 삭제
+        labels_result = await db.labels.delete_many({"document_id": file_id})
+        deleted_items["labels"] = labels_result.deleted_count
+        
+        # 5. 기타 컬렉션들 정리 (에러가 나도 계속 진행)
+        try:
+            # summaries, qapairs, recommendations에서 혹시 file_id 참조 제거
+            await db.summaries.delete_many({"file_id": file_id})
+            await db.qapairs.delete_many({
+                "$or": [
+                    {"file_id": file_id},
+                    {"source": file_id}
+                ]
+            })
+            await db.recommendations.delete_many({"file_id": file_id})
+        except Exception as e:
+            logger.warning(f"기타 컬렉션 정리 중 오류 (무시): {e}")
+        
+        # 6. 임시 파일 삭제
+        try:
+            upload_dir = Path("uploads")
+            deleted_files = []
+            for temp_file in upload_dir.glob(f"{file_id}_*"):
+                temp_file.unlink()
+                deleted_files.append(str(temp_file))
+            if deleted_files:
+                logger.info(f"임시 파일 삭제: {deleted_files}")
+        except Exception as e:
+            logger.warning(f"임시 파일 삭제 실패 (무시): {e}")
+        
+        # 7. 결과 검증 및 응답
+        total_deleted = sum(deleted_items.values())
+        
+        logger.info(f"파일 삭제 완료: {file_id}")
+        logger.info(f"삭제된 항목들: {deleted_items}")
+        
+        if total_deleted == 0:
+            # 삭제할 데이터가 없으면 404
+            raise HTTPException(status_code=404, detail="삭제할 파일을 찾을 수 없습니다.")
         
         return {
             "success": True,
-            "message": "파일이 삭제되었습니다.",
-            "deleted_chunks": chunks_result.deleted_count
+            "message": f"파일이 완전히 삭제되었습니다. (총 {total_deleted}개 항목)",
+            "file_id": file_id,
+            "deleted_counts": deleted_items,
+            "total_deleted": total_deleted
         }
         
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"파일 삭제 실패: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"파일 삭제 중 오류가 발생했습니다: {str(e)}")
 
 @router.get("/list")
 async def list_files(folder_id: Optional[str] = None, limit: int = 50, skip: int = 0):
@@ -409,24 +539,30 @@ async def list_files(folder_id: Optional[str] = None, limit: int = 50, skip: int
         if folder_id:
             filter_dict["folder_id"] = folder_id
         
-        # 문서 목록 조회
-        cursor = db.documents.find(filter_dict).sort("upload_time", -1).skip(skip).limit(limit)
+        # 문서 목록 조회 (새로운 구조에 맞는 정렬)
+        cursor = db.documents.find(filter_dict).sort("created_at", -1).skip(skip).limit(limit)
         documents = await cursor.to_list(None)
         
         # 각 문서의 청크 개수 조회
         result = []
         for doc in documents:
-            chunks_count = await db.chunks.count_documents({"file_id": doc["file_id"]})
+            file_metadata = doc.get("file_metadata", {})
+            file_id = file_metadata.get("file_id")
+            
+            if not file_id:
+                continue
+                
+            chunks_count = await db.chunks.count_documents({"file_id": file_id})
             
             result.append({
-                "file_id": doc["file_id"],
-                "original_filename": doc["original_filename"],
-                "file_type": doc["file_type"],
-                "file_size": doc["file_size"],
+                "file_id": file_id,
+                "original_filename": file_metadata.get("original_filename", "알 수 없는 파일"),
+                "file_type": file_metadata.get("file_type", "unknown"),
+                "file_size": file_metadata.get("file_size", 0),
                 "processed_chunks": chunks_count,
-                "upload_time": doc["upload_time"],
+                "upload_time": doc.get("created_at", datetime.utcnow()),
                 "folder_id": doc.get("folder_id"),
-                "description": doc.get("description")
+                "description": file_metadata.get("description")
             })
         
         return {
@@ -446,8 +582,16 @@ async def semantic_search_files(
     k: int = 5,  # 결과 개수
     folder_id: Optional[str] = None
 ):
-    """🧠 AI 기반 의미 검색 - 벡터 유사도로 파일 찾기"""
+    """AI 기반 의미 검색 - 벡터 유사도로 파일 찾기"""
     try:
+        # 검색어 유효성 검사
+        if not q or not q.strip():
+            raise HTTPException(status_code=400, detail="검색어가 필요합니다.")
+        
+        # 검색어 정리
+        query = q.strip()
+        logger.info(f"시맨틱 검색 시작 - 쿼리: '{query}', k: {k}, folder_id: {folder_id}")
+        
         db = await get_database()
         vector_search = VectorSearch(db)
         
@@ -458,7 +602,7 @@ async def semantic_search_files(
         
         # 벡터 검색 실행
         search_results = await vector_search.search_similar(
-            query=q,
+            query=query,
             k=k * 3,  # 더 많이 찾아서 파일별로 그룹화
             filter_dict=filter_dict
         )
@@ -496,14 +640,18 @@ async def semantic_search_files(
         # 응답 생성
         search_results = [FileSearchResult(**file_data) for file_data in top_files]
         
+        logger.info(f"시맨틱 검색 완료 - {len(search_results)}개 결과")
+        
         return FileSearchResponse(
             files=search_results,
             total_found=len(search_results),
-            query=q,
+            query=query,
             search_type="semantic",
             execution_time=0.0  # 실제 시간 측정은 생략
         )
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"의미 검색 실패: {e}")
         raise HTTPException(status_code=500, detail=f"의미 검색 중 오류가 발생했습니다: {str(e)}")
@@ -514,22 +662,24 @@ async def get_file_content(file_id: str):
     try:
         db = await get_database()
         
-        # documents 컬렉션에서 파일 정보 및 텍스트 조회
+        # documents 컬렉션에서 파일 정보 및 텍스트 조회 (새로운 구조)
         document = await db.documents.find_one(
-            {"file_id": file_id},
-            {"original_filename": 1, "raw_text": 1, "processed_text": 1, "file_type": 1, "upload_time": 1}
+            {"file_metadata.file_id": file_id},
+            {"file_metadata": 1, "raw_text": 1, "created_at": 1}
         )
         
         if not document:
             raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다.")
         
+        file_metadata = document.get("file_metadata", {})
+        
         return {
             "file_id": file_id,
-            "original_filename": document["original_filename"],
-            "file_type": document["file_type"],
-            "upload_time": document["upload_time"],
+            "original_filename": file_metadata.get("original_filename", "알 수 없는 파일"),
+            "file_type": file_metadata.get("file_type", "unknown"),
+            "upload_time": document.get("created_at", datetime.utcnow()),
             "raw_text": document.get("raw_text", ""),
-            "processed_text": document.get("processed_text", ""),
+            "processed_text": document.get("raw_text", ""),  # 새 구조에서는 동일
             "text_length": len(document.get("raw_text", ""))
         }
         
@@ -544,28 +694,83 @@ async def update_file_info(file_id: str, request: FileUpdateRequest):
     """파일 정보 업데이트 (파일명, 설명, 폴더 등)"""
     try:
         db = await get_database()
+        from bson import ObjectId
+        
+        # folder_id와 folder_title 동시 사용 방지
+        if request.folder_id and request.folder_title:
+            raise HTTPException(
+                status_code=400, 
+                detail="folder_id와 folder_title은 동시에 입력할 수 없습니다. 둘 중 하나만 선택해주세요."
+            )
         
         # 업데이트할 필드 준비
         update_fields = {}
-        if request.filename is not None and request.filename.strip():
-            update_fields["original_filename"] = request.filename.strip()
-        if request.description is not None:
-            update_fields["description"] = request.description.strip() if request.description.strip() else None
-        if request.folder_id is not None:
-            update_fields["folder_id"] = request.folder_id.strip() if request.folder_id.strip() else None
+        file_metadata_updates = {}
         
-        if not update_fields:
+        if request.filename is not None and request.filename.strip():
+            file_metadata_updates["file_metadata.original_filename"] = request.filename.strip()
+        
+        if request.description is not None:
+            description_value = request.description.strip() if request.description.strip() else None
+            file_metadata_updates["file_metadata.description"] = description_value
+        
+        # 폴더 처리
+        final_folder_id = None
+        
+        # folder_id 직접 입력
+        if request.folder_id is not None:
+            folder_id_input = request.folder_id.strip() if request.folder_id.strip() else None
+            
+            if folder_id_input and folder_id_input not in ["string", "null"]:
+                # ObjectId 유효성 검증
+                if not ObjectId.is_valid(folder_id_input):
+                    raise HTTPException(status_code=400, detail="유효하지 않은 folder_id 형식입니다.")
+                
+                # 폴더 존재 확인
+                folder_exists = await db.folders.find_one({"_id": ObjectId(folder_id_input)})
+                if not folder_exists:
+                    raise HTTPException(status_code=404, detail=f"folder_id '{folder_id_input}'에 해당하는 폴더를 찾을 수 없습니다.")
+                
+                final_folder_id = folder_id_input
+            else:
+                final_folder_id = None  # 폴더 해제
+            
+            update_fields["folder_id"] = final_folder_id
+        
+        # folder_title로 폴더 검색
+        elif request.folder_title is not None:
+            folder_title_input = request.folder_title.strip() if request.folder_title.strip() else None
+            
+            if folder_title_input and folder_title_input not in ["string", "null"]:
+                # 폴더 title로 검색
+                folder_by_title = await db.folders.find_one({"title": folder_title_input})
+                if not folder_by_title:
+                    raise HTTPException(
+                        status_code=404, 
+                        detail=f"'{folder_title_input}' 제목의 폴더를 찾을 수 없습니다."
+                    )
+                
+                final_folder_id = str(folder_by_title["_id"])
+                update_fields["folder_id"] = final_folder_id
+                logger.info(f"폴더 title '{folder_title_input}' -> folder_id: {final_folder_id}")
+            else:
+                final_folder_id = None  # 폴더 해제
+                update_fields["folder_id"] = final_folder_id
+        
+        # 업데이트할 내용이 있는지 확인
+        all_updates = {**update_fields, **file_metadata_updates}
+        if not all_updates:
             raise HTTPException(status_code=400, detail="업데이트할 내용이 없습니다.")
         
-        # 파일 존재 확인
-        document = await db.documents.find_one({"file_id": file_id})
+        # 파일 존재 확인 (새로운 구조에 맞게 수정)
+        document = await db.documents.find_one({"file_metadata.file_id": file_id})
         if not document:
             raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다.")
         
-        # 문서 업데이트
+        # 문서 업데이트 (새로운 구조에 맞게 쿼리 수정)
         result = await db.documents.update_one(
-            {"file_id": file_id},
-            {"$set": update_fields}
+            {"file_metadata.file_id": file_id},
+            {"$set": all_updates}
         )
         
         if result.modified_count == 0:
@@ -578,12 +783,33 @@ async def update_file_info(file_id: str, request: FileUpdateRequest):
                 {"$set": {"metadata.folder_id": update_fields["folder_id"]}}
             )
         
-        logger.info(f"파일 정보 업데이트 완료: {file_id} - {update_fields}")
+        # 성공 메시지 생성
+        updated_info = []
+        if request.filename:
+            updated_info.append(f"파일명: {request.filename}")
+        if request.description is not None:
+            updated_info.append(f"설명: {request.description or '(제거)'}")
+        if final_folder_id:
+            try:
+                folder_info = await db.folders.find_one({"_id": ObjectId(final_folder_id)})
+                folder_name = folder_info["title"] if folder_info else final_folder_id
+                updated_info.append(f"폴더: {folder_name}")
+            except:
+                updated_info.append(f"폴더: {final_folder_id}")
+        elif "folder_id" in update_fields and not final_folder_id:
+            updated_info.append("폴더: (해제)")
+        
+        success_message = "파일 정보가 업데이트되었습니다."
+        if updated_info:
+            success_message += f" ({', '.join(updated_info)})"
+        
+        logger.info(f"파일 정보 업데이트 완료: {file_id} - {all_updates}")
         
         return {
             "success": True,
-            "message": "파일 정보가 업데이트되었습니다.",
-            "updated_fields": update_fields
+            "message": success_message,
+            "updated_fields": all_updates,
+            "file_id": file_id
         }
         
     except HTTPException:
@@ -598,17 +824,18 @@ async def get_file_preview(file_id: str, max_length: int = 500):
     try:
         db = await get_database()
         
-        # documents 컬렉션에서 파일 정보 조회
+        # documents 컬렉션에서 파일 정보 조회 (새로운 구조에 맞게 수정)
         document = await db.documents.find_one(
-            {"file_id": file_id},
-            {"original_filename": 1, "raw_text": 1, "file_type": 1, "text_length": 1}
+            {"file_metadata.file_id": file_id},
+            {"file_metadata": 1, "raw_text": 1}
         )
         
         if not document:
             raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다.")
         
+        file_metadata = document.get("file_metadata", {})
         raw_text = document.get("raw_text", "")
-        file_type = document.get("file_type", "unknown")
+        file_type = file_metadata.get("file_type", "unknown")
         total_length = len(raw_text)
         
         # 미리보기 텍스트 생성
@@ -621,13 +848,22 @@ async def get_file_preview(file_id: str, max_length: int = 500):
             current_length = 0
             preview_lines = []
             
-            for line in lines:
-                if current_length + len(line) > max_length:
-                    break
-                preview_lines.append(line)
-                current_length += len(line) + 1  # +1 for newline
-            
-            preview_text = '\n'.join(preview_lines)
+            # 첫 번째 줄이 너무 길면 단순히 잘라서 사용
+            if lines and len(lines[0]) > max_length:
+                preview_text = raw_text[:max_length] + "..."
+            else:
+                # 줄 단위로 추가
+                for line in lines:
+                    if current_length + len(line) + 1 > max_length:  # +1 for newline
+                        break
+                    preview_lines.append(line)
+                    current_length += len(line) + 1
+                
+                preview_text = '\n'.join(preview_lines)
+                
+                # 만약 preview_text가 여전히 비어있다면 강제로 일부 텍스트 추가
+                if not preview_text and raw_text:
+                    preview_text = raw_text[:max_length] + ("..." if len(raw_text) > max_length else "")
             
             # 파일 타입에 따른 미리보기 타입 결정
             if file_type == "pdf":
@@ -644,7 +880,7 @@ async def get_file_preview(file_id: str, max_length: int = 500):
         
         return FilePreviewResponse(
             file_id=file_id,
-            original_filename=document["original_filename"],
+            original_filename=file_metadata.get("original_filename", "알 수 없는 파일"),
             file_type=file_type,
             preview_text=preview_text,
             preview_length=preview_length,
@@ -665,14 +901,16 @@ async def get_file_preview_with_chunks(file_id: str, chunk_count: int = 3):
     try:
         db = await get_database()
         
-        # 파일 기본 정보 조회
+        # 파일 기본 정보 조회 (새로운 구조에 맞게 수정)
         document = await db.documents.find_one(
-            {"file_id": file_id},
-            {"original_filename": 1, "file_type": 1}
+            {"file_metadata.file_id": file_id},
+            {"file_metadata": 1}
         )
         
         if not document:
             raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다.")
+        
+        file_metadata = document.get("file_metadata", {})
         
         # 처음 몇 개 청크 조회
         chunks_cursor = db.chunks.find(
@@ -693,8 +931,8 @@ async def get_file_preview_with_chunks(file_id: str, chunk_count: int = 3):
         
         return {
             "file_id": file_id,
-            "original_filename": document["original_filename"],
-            "file_type": document["file_type"],
+            "original_filename": file_metadata.get("original_filename", "알 수 없는 파일"),
+            "file_type": file_metadata.get("file_type", "unknown"),
             "preview_text": preview_text,
             "preview_chunks": len(chunks),
             "total_chunks": total_chunks,

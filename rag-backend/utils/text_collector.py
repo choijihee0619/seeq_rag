@@ -38,10 +38,10 @@ class TextCollector:
                     if combined_text.strip():
                         return combined_text
             
-            # 청크가 없거나 use_chunks=False면 documents에서 가져오기
-            document = await db.documents.find_one({"file_id": file_id})
+            # 청크가 없거나 use_chunks=False면 documents에서 가져오기 (새로운 구조에 맞게 수정)
+            document = await db.documents.find_one({"file_metadata.file_id": file_id})
             if document:
-                return document.get("processed_text", document.get("raw_text", ""))
+                return document.get("raw_text", "")
             
             return ""
             
@@ -122,10 +122,10 @@ class TextCollector:
                     if text.strip():
                         texts.append(text)
             else:
-                # documents에서 텍스트 수집
-                documents = await db.documents.find({"file_id": {"$in": file_ids}}).to_list(None)
+                # documents에서 텍스트 수집 (새로운 구조에 맞게 수정)
+                documents = await db.documents.find({"file_metadata.file_id": {"$in": file_ids}}).to_list(None)
                 for doc in documents:
-                    text = doc.get("processed_text", doc.get("raw_text", ""))
+                    text = doc.get("raw_text", "")
                     if text.strip():
                         texts.append(text)
             
@@ -152,14 +152,16 @@ class TextCollector:
             source_info = {}
             
             if file_id:
-                document = await db.documents.find_one({"file_id": file_id})
+                # 새로운 구조에 맞게 문서 조회 수정
+                document = await db.documents.find_one({"file_metadata.file_id": file_id})
                 if document:
                     chunks_count = await db.chunks.count_documents({"file_id": file_id}) if use_chunks else 0
                     text_length = len(await TextCollector.get_text_from_file(db, file_id, use_chunks))
                     
+                    file_metadata = document.get("file_metadata", {})
                     source_info = {
                         "file_id": file_id,
-                        "filename": document.get("original_filename", "알 수 없는 파일"),
+                        "filename": file_metadata.get("original_filename", "알 수 없는 파일"),
                         "source_type": "chunks" if use_chunks and chunks_count > 0 else "document",
                         "chunk_count": chunks_count,
                         "text_length": text_length

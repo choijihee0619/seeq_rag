@@ -7,7 +7,7 @@ import asyncio
 import httpx
 from typing import List, Dict, Optional
 from utils.logger import get_logger
-from ai_processing.labeler import AutoLabeler
+from ai_processing.auto_labeler import AutoLabeler
 
 logger = get_logger(__name__)
 
